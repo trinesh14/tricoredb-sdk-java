@@ -1,0 +1,2 @@
+Main-Class: Runner
+Class-Path: ../../target/tricoredb-0.1.0.jar

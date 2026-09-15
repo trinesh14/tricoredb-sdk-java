@@ -1,0 +1,10 @@
+{
+  "name": "java",
+  "probe": ["java", "-version"],
+  "build": [
+    ["./mvnw.cmd", "-B", "-q", "-DskipTests", "-Dmaven.javadoc.skip=true", "-Dmaven.source.skip=true", "package"],
+    ["javac", "--release", "17", "-cp", "target/tricoredb-0.1.0.jar", "-d", "conformance/out/classes", "conformance/Runner.java"],
+    ["jar", "--create", "--file", "conformance/out/runner.jar", "--manifest", "conformance/MANIFEST.MF", "-C", "conformance/out/classes", "."]
+  ],
+  "run": ["java", "-jar", "conformance/out/runner.jar"]
+}

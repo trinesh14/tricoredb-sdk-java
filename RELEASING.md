@@ -1,6 +1,6 @@
 # Releasing to Maven Central
 
-How a maintainer publishes `io.github.trinesh14:tricoredb` to Maven Central.
+How a maintainer publishes `com.tricoredb:tricoredb` to Maven Central.
 Run every command in **Git Bash** from the repository root: it provides both
 `gpg` and a shell for `./mvnw`, so one keyring is used throughout.
 
@@ -8,10 +8,14 @@ Run every command in **Git Bash** from the repository root: it provides both
 
 ### 1. Central Portal account and namespace
 
-1. Sign up at <https://central.sonatype.com> **with the GitHub account
-   `trinesh14`**. Signing up with GitHub verifies the namespace
-   `io.github.trinesh14` automatically; an email sign-up does not.
-2. Confirm that **Namespaces** lists `io.github.trinesh14` as verified.
+1. Sign in at <https://central.sonatype.com> (Google, GitHub or a username
+   and password all work).
+2. Open **Namespaces** → **Add Namespace** and enter `com.tricoredb`.
+3. Copy the **Verification Key** the portal shows.
+4. In Cloudflare DNS for `tricoredb.com`, add a new **TXT** record whose value
+   is that key. Leave the website's records (A, AAAA, CNAME, MX) untouched.
+5. Back in the portal, click **Verify** and wait until `com.tricoredb` shows as
+   verified. Keep the TXT record afterwards; it does not affect the website.
 
 ### 2. Publishing token
 
@@ -91,7 +95,7 @@ repository **public** before publishing, so the links on Maven Central work.
    ```
 
 6. After a short delay the artifact appears on
-   <https://central.sonatype.com/artifact/io.github.trinesh14/tricoredb>; it can
+   <https://central.sonatype.com/artifact/com.tricoredb/tricoredb>; it can
    take longer to reach `repo1.maven.org` and search.
 
 A version published to Maven Central can never be changed or removed. If

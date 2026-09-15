@@ -1,21 +1,21 @@
-import static io.github.trinesh14.tricoredb.GraphDirection.OUTGOING;
+import static com.tricoredb.GraphDirection.OUTGOING;
 
-import io.github.trinesh14.tricoredb.CachePair;
-import io.github.trinesh14.tricoredb.DocumentFilter;
-import io.github.trinesh14.tricoredb.DocumentUpdate;
-import io.github.trinesh14.tricoredb.GraphEdge;
-import io.github.trinesh14.tricoredb.GraphNode;
-import io.github.trinesh14.tricoredb.GraphPath;
-import io.github.trinesh14.tricoredb.GraphTraversal;
-import io.github.trinesh14.tricoredb.LlmSource;
-import io.github.trinesh14.tricoredb.Pool;
-import io.github.trinesh14.tricoredb.SqlStatement;
-import io.github.trinesh14.tricoredb.TransactionResult;
-import io.github.trinesh14.tricoredb.TriCore;
-import io.github.trinesh14.tricoredb.TriCoreException;
-import io.github.trinesh14.tricoredb.VectorItem;
-import io.github.trinesh14.tricoredb.VectorMatch;
-import io.github.trinesh14.tricoredb.VectorPage;
+import com.tricoredb.CachePair;
+import com.tricoredb.DocumentFilter;
+import com.tricoredb.DocumentUpdate;
+import com.tricoredb.GraphEdge;
+import com.tricoredb.GraphNode;
+import com.tricoredb.GraphPath;
+import com.tricoredb.GraphTraversal;
+import com.tricoredb.LlmSource;
+import com.tricoredb.Pool;
+import com.tricoredb.SqlStatement;
+import com.tricoredb.TransactionResult;
+import com.tricoredb.TriCore;
+import com.tricoredb.TriCoreException;
+import com.tricoredb.VectorItem;
+import com.tricoredb.VectorMatch;
+import com.tricoredb.VectorPage;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -67,7 +67,7 @@ public final class Examples {
                 concurrency();
             }
             default -> {
-                System.out.println("usage: java -cp "out;../target/tricoredb-0.1.0.jar" Examples <sample>");
+                System.out.println("usage: java -cp \"out" + java.io.File.pathSeparator + "../target/tricoredb-0.1.0.jar\" Examples <sample>");
                 System.out.println("  basic  sql  nosql  vector  graph  cache  errors  concurrency  all");
                 System.exit(args.length > 0 ? 2 : 0);
             }
@@ -229,7 +229,7 @@ public final class Examples {
             Ex.ignoreMissing(() -> db.vectorDropCollection(c));
 
             Ex.section("collection");
-            db.vectorCreateCollection(c, 4, io.github.trinesh14.tricoredb.VectorMetric.COSINE);
+            db.vectorCreateCollection(c, 4, com.tricoredb.VectorMetric.COSINE);
             Ex.show("created", c + " (dimension 4, cosine)");
             Ex.show("describe", db.vectorDescribeCollection(c));
 

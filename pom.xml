@@ -5,7 +5,7 @@
 
   <modelVersion>4.0.0</modelVersion>
 
-  <groupId>io.github.trinesh14</groupId>
+  <groupId>com.tricoredb</groupId>
   <artifactId>tricoredb</artifactId>
   <version>0.1.0</version>
   <packaging>jar</packaging>
@@ -138,7 +138,7 @@
         <configuration>
           <archive>
             <manifestEntries>
-              <Automatic-Module-Name>io.github.trinesh14.tricoredb</Automatic-Module-Name>
+              <Automatic-Module-Name>com.tricoredb</Automatic-Module-Name>
               <Implementation-Title>${project.name}</Implementation-Title>
               <Implementation-Version>${project.version}</Implementation-Version>
             </manifestEntries>

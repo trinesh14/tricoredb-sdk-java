@@ -1,5 +1,5 @@
-import io.github.trinesh14.tricoredb.TriCore;
-import io.github.trinesh14.tricoredb.TriCoreException;
+import com.tricoredb.TriCore;
+import com.tricoredb.TriCoreException;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;

@@ -6,14 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [0.1.0] - 2026-09-15
 
-First standalone release: `io.github.trinesh14:tricoredb`. Requires Java 17 or
+First standalone release: `com.tricoredb:tricoredb`. Requires Java 17 or
 newer; tested on Java 17, 21 and 25 against a live TriCoreDB server.
 
 ### Added
 - Ported from the in-tree TriCoreDB Java driver, which already passed all 82
   conformance operations. Its behaviour is unchanged.
-- Java package `io.github.trinesh14.tricoredb`, matching the Maven groupId
-  (it was `com.tricoredb` in-tree). The JAR's `Automatic-Module-Name` is the same.
+- Java package `com.tricoredb` (the package the in-tree driver already used),
+  matching the Maven groupId. The JAR's `Automatic-Module-Name` is the same.
 - Maven build with the Maven Wrapper. Produces the main, sources and javadoc
   jars, targets Java 17, and has no runtime dependencies.
 - The in-tree test programs are now JUnit 5 tests. The live tests start their

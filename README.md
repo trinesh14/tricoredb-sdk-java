@@ -12,7 +12,7 @@ Maven:
 
 ```xml
 <dependency>
-  <groupId>io.github.trinesh14</groupId>
+  <groupId>com.tricoredb</groupId>
   <artifactId>tricoredb</artifactId>
   <version>0.1.0</version>
 </dependency>
@@ -21,16 +21,16 @@ Maven:
 Gradle (Kotlin DSL):
 
 ```kotlin
-implementation("io.github.trinesh14:tricoredb:0.1.0")
+implementation("com.tricoredb:tricoredb:0.1.0")
 ```
 
 Gradle (Groovy):
 
 ```groovy
-implementation 'io.github.trinesh14:tricoredb:0.1.0'
+implementation 'com.tricoredb:tricoredb:0.1.0'
 ```
 
-Everything is in the package `io.github.trinesh14.tricoredb`, and the JPMS
+Everything is in the package `com.tricoredb`, and the JPMS
 automatic module name is the same.
 
 ## Running a server
@@ -62,7 +62,7 @@ A `TriCore` is one authenticated connection and is `AutoCloseable`.
 TriCoreDB's default port is `8427`.
 
 ```java
-import io.github.trinesh14.tricoredb.TriCore;
+import com.tricoredb.TriCore;
 
 try (TriCore db = TriCore.connect("127.0.0.1", 8427, "admin", "secret")) {
     db.ping();

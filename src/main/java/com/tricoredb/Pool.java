@@ -48,6 +48,25 @@ public final class Pool implements AutoCloseable {
     private int created = 0;
     private boolean closed = false;
 
+    private volatile boolean followLeader = true;
+    private volatile int leaderRetries = 5;
+    private volatile long leaderRetryDelayMs = 250;
+
+    /** Applied to every connection this pool opens; see {@link TriCore#setFollowLeader}. */
+    public void setFollowLeader(boolean follow) {
+        this.followLeader = follow;
+    }
+
+    /** See {@link TriCore#setLeaderRetries}. */
+    public void setLeaderRetries(int retries) {
+        this.leaderRetries = retries;
+    }
+
+    /** See {@link TriCore#setLeaderRetryDelayMs}. */
+    public void setLeaderRetryDelayMs(long delayMs) {
+        this.leaderRetryDelayMs = delayMs;
+    }
+
     public Pool(String host, int port, String user, String secret, int size) {
         this(host, port, user, secret, size, "tricoredb-java-pool", 10_000, null);
     }
@@ -201,7 +220,11 @@ public final class Pool implements AutoCloseable {
             }
         }
         try {
-            return TriCore.connect(host, port, user, secret, clientName, connectTimeoutMs, tls);
+            TriCore conn = TriCore.connect(host, port, user, secret, clientName, connectTimeoutMs, tls);
+            conn.setFollowLeader(followLeader);
+            conn.setLeaderRetries(leaderRetries);
+            conn.setLeaderRetryDelayMs(leaderRetryDelayMs);
+            return conn;
         } catch (RuntimeException e) {
             // Give the reserved slot back, or the pool permanently shrinks.
             synchronized (lock) {

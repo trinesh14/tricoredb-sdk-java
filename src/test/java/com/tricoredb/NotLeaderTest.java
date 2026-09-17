@@ -26,6 +26,7 @@ class NotLeaderTest {
             ScriptedPeer.expectFrame(s);
         })) {
             try (TriCore db = peer.connect()) {
+                db.setFollowLeader(false);
                 return assertThrows(TriCoreException.class,
                         () -> db.execute("INSERT INTO t VALUES (?)", List.of(1), "main"));
             }
@@ -63,7 +64,7 @@ class NotLeaderTest {
     }
 
     @Test
-    void theDriverDoesNotFollowTheRedirect() throws Exception {
+    void withFollowLeaderOffTheDriverDoesNotFollowTheRedirect() throws Exception {
         int[] connections = {0};
         try (ScriptedPeer peer = ScriptedPeer.start(s -> {
             connections[0]++;
@@ -76,6 +77,7 @@ class NotLeaderTest {
             ScriptedPeer.expectFrame(s);
         })) {
             try (TriCore db = peer.connect()) {
+                db.setFollowLeader(false);
                 TriCoreException e = assertThrows(TriCoreException.class, () -> db.execute("INSERT INTO t VALUES (1)"));
                 assertTrue(e.isNotLeader());
                 assertEquals("127.0.0.1:1", e.leaderHint());

@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-09-17
+
+### Added
+
+- Following the leader: a request refused with `not_leader` is sent again, to
+  the leader the refusal names (over a new connection that replaces the
+  current one) or, while no leader is known, to the same node after a pause.
+  On by default; `TriCore.setFollowLeader(false)` restores the previous
+  behaviour, and `setLeaderRetries` (5) and `setLeaderRetryDelayMs` (250)
+  bound it. `Pool` has the same setters. Never inside a session transaction.
+- `TriCoreException.ERROR_CODE_OUTCOME_UNKNOWN`: a request that may or may not
+  have been applied. It is never sent again.
+- `TriCore.address()`.
+
 ## [0.1.0] - 2026-09-15
 
 First standalone release: `com.tricoredb:tricoredb`. Requires Java 17 or

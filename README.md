@@ -14,20 +14,20 @@ Maven:
 <dependency>
   <groupId>com.tricoredb</groupId>
   <artifactId>tricoredb</artifactId>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
 </dependency>
 ```
 
 Gradle (Kotlin DSL):
 
 ```kotlin
-implementation("com.tricoredb:tricoredb:0.1.0")
+implementation("com.tricoredb:tricoredb:0.2.0")
 ```
 
 Gradle (Groovy):
 
 ```groovy
-implementation 'com.tricoredb:tricoredb:0.1.0'
+implementation 'com.tricoredb:tricoredb:0.2.0'
 ```
 
 Everything is in the package `com.tricoredb`, and the JPMS
@@ -234,18 +234,33 @@ try {
 } catch (TriCoreException e) {
     if (e.isNotLeader()) {                        // errorCode() == "not_leader"
         String leader = e.leaderHint();           // "host:port", or null if the leader is unknown
-        // Your application decides whether and where to retry.
+        // The driver already sent it again (see below) and was still refused.
     } else {
         System.err.println(e.errorCode() + ": " + e.getMessage());
     }
 }
 ```
 
-A write that reaches a Raft follower fails with `not_leader`. `leaderHint()`
-gives the leader's native-protocol address when the cluster knows it, and is
-`null` during an election or when there is no address. **The driver never
-follows a redirect by itself**: resending a write elsewhere is a policy
-decision that belongs to your application.
+In a cluster only the leader accepts writes, and a follower refuses with
+`not_leader`. The driver handles that itself (`setFollowLeader(true)`, the
+default):
+
+- when the refusal names the leader (`leaderHint()`), it opens a connection
+  there with the same user, secret and TLS settings (the leader's host is the
+  certificate name), sends the request again, and keeps that connection
+  (`address()` reports it);
+- while an election is in progress (no hint), it waits and asks the same node
+  again, pausing 250 ms, then 500 ms, up to 2 s (`setLeaderRetryDelayMs`);
+- after `setLeaderRetries` (5) attempts it throws the last refusal.
+
+This is safe because a `not_leader` refusal was applied nowhere. Nothing is
+sent again inside a session transaction, and never a refusal with
+`errorCode()` equal to `TriCoreException.ERROR_CODE_OUTCOME_UNKNOWN`: a follower
+handed that request to the leader and lost the answer, or the leader could not
+confirm it, so it may have been applied. The leader's address must be reachable
+from your application; when it is not, the driver keeps its connection and
+waits. `Pool` has the same three setters for the connections it opens. Call
+`setFollowLeader(false)` to handle redirects yourself.
 
 ## TLS
 

@@ -135,6 +135,17 @@ public final class TlsOptions {
         }
     }
 
+    /** The same options, checking the certificate against {@code name}. */
+    TlsOptions forServer(String name) {
+        Builder b = builder()
+                .serverName(name)
+                .dangerAcceptInvalidCerts(dangerAcceptInvalidCerts);
+        b.caFile = caFile;
+        b.clientCertFile = clientCertFile;
+        b.clientKeyFile = clientKeyFile;
+        return b.build();
+    }
+
     String serverName() {
         return serverName;
     }

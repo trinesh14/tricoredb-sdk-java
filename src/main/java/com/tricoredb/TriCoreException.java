@@ -18,6 +18,13 @@ public class TriCoreException extends RuntimeException {
      */
     public static final String ERROR_CODE_NOT_LEADER = "not_leader";
 
+    /**
+     * The code of a request a follower handed to the leader and lost the answer to,
+     * or one the leader could not confirm. It may or may not have been applied, so
+     * the driver never sends it again.
+     */
+    public static final String ERROR_CODE_OUTCOME_UNKNOWN = "outcome_unknown";
+
     private final String errorCode;
     private final String leaderHint;
 

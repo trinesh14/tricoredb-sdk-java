@@ -53,7 +53,7 @@ public final class TriCore implements AutoCloseable {
      * major. The two move for different reasons, and collapsing them would make
      * one a silent proxy for the other.
      */
-    public static final String SDK_VERSION = "0.1.0";
+    public static final String SDK_VERSION = "0.2.0";
 
     /**
      * This SDK understands a request-scoped correlation id, which the server
@@ -262,6 +262,22 @@ public final class TriCore implements AutoCloseable {
     // Held between sending a frame and reading its reply. See `exchange`.
     private final AtomicBoolean inFlight = new AtomicBoolean(false);
 
+    // Following the leader. See setFollowLeader.
+    private static final long MAX_LEADER_RETRY_DELAY_MS = 2_000;
+    private static final int FOLLOW_CONNECT_TIMEOUT_MS = 3_000;
+    private boolean followLeader = true;
+    private int leaderRetries = 5;
+    private long leaderRetryDelayMs = 250;
+
+    // What connect() was given, to open a connection to the leader the same way.
+    private String address = "";
+    private String authUser;
+    private String authSecret;
+    private String clientName;
+    private int connectTimeoutMs;
+    private TlsOptions tls;
+    private long features;
+
     private TriCore(Socket socket) throws IOException {
         this.socket = socket;
         this.in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
@@ -350,6 +366,13 @@ public final class TriCore implements AutoCloseable {
             // Armed only now, so the connect budget never leaks onto a running
             // statement.
             socket.setSoTimeout(readTimeoutMs);
+            db.address = joinAddress(host, port);
+            db.authUser = user;
+            db.authSecret = secret;
+            db.clientName = clientName;
+            db.connectTimeoutMs = timeoutMs;
+            db.tls = tls;
+            db.features = features;
             return db;
         } catch (SocketTimeoutException e) {
             throw new TriCoreTimeoutException(
@@ -358,6 +381,46 @@ public final class TriCore implements AutoCloseable {
         } catch (IOException e) {
             throw new TriCoreException("connect failed: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Send a request again when a cluster node refuses it with {@code not_leader}.
+     * On by default.
+     *
+     * <p>The request goes to the leader the refusal names, over a new connection
+     * that replaces this one (same user, secret and TLS settings, with the
+     * leader's host as the certificate name), or, while no leader is known, to the
+     * same node after a pause. That is safe because a {@code not_leader} refusal
+     * was applied nowhere. It never happens inside a session transaction, and never
+     * for {@link TriCoreException#ERROR_CODE_OUTCOME_UNKNOWN}.
+     */
+    public void setFollowLeader(boolean follow) {
+        this.followLeader = follow;
+    }
+
+    public boolean followLeader() {
+        return followLeader;
+    }
+
+    /** How many times a refused request is sent again. Default 5. */
+    public void setLeaderRetries(int retries) {
+        if (retries < 0) {
+            throw new IllegalArgumentException("leaderRetries must be >= 0");
+        }
+        this.leaderRetries = retries;
+    }
+
+    /** The first pause before asking again; it doubles up to 2 s. Default 250 ms. */
+    public void setLeaderRetryDelayMs(long delayMs) {
+        if (delayMs < 0) {
+            throw new IllegalArgumentException("leaderRetryDelayMs must be >= 0");
+        }
+        this.leaderRetryDelayMs = delayMs;
+    }
+
+    /** The {@code host:port} this connection talks to. It changes when the driver follows the leader. */
+    public String address() {
+        return address;
     }
 
     /**
@@ -550,6 +613,104 @@ public final class TriCore implements AutoCloseable {
             options.put("timeout_ms", requestTimeoutMs);
             payload.put("options", options);
         }
+        long pause = leaderRetryDelayMs;
+        for (int retried = 0; ; retried++) {
+            try {
+                return sendRequest(payload);
+            } catch (TriCoreException e) {
+                if (!e.isNotLeader()) {
+                    throw e;
+                }
+                // A `not_leader` refusal was applied nowhere, so sending it again
+                // cannot apply it twice. A session transaction belongs to this
+                // connection and cannot move.
+                if (!followLeader || txnOpen || retried >= leaderRetries) {
+                    if (retried == 0) {
+                        throw e;
+                    }
+                    throw new TriCoreException(e.getMessage() + " (sent again " + retried
+                            + " times, refused each time)", e.errorCode(), e.leaderHint());
+                }
+                String hint = e.leaderHint();
+                if (hint != null && !hint.equals(address) && moveTo(hint)) {
+                    continue;
+                }
+                try {
+                    Thread.sleep(pause);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+                pause = Math.min(Math.max(pause * 2, 1), MAX_LEADER_RETRY_DELAY_MS);
+            }
+        }
+    }
+
+    /**
+     * Replace this connection with one to {@code target}, opened the way this one
+     * was. False, leaving this connection untouched, when that fails.
+     */
+    private boolean moveTo(String target) {
+        String host;
+        String portText;
+        if (target.startsWith("[")) {
+            int end = target.indexOf("]:");
+            if (end < 0) {
+                return false;
+            }
+            host = target.substring(1, end);
+            portText = target.substring(end + 2);
+        } else {
+            int colon = target.lastIndexOf(':');
+            if (colon <= 0) {
+                return false;
+            }
+            host = target.substring(0, colon);
+            portText = target.substring(colon + 1);
+        }
+        int port;
+        try {
+            port = Integer.parseInt(portText);
+        } catch (NumberFormatException e) {
+            return false;
+        }
+        if (host.isEmpty() || port <= 0 || port > 65535) {
+            return false;
+        }
+        int budget = connectTimeoutMs > 0 && connectTimeoutMs < FOLLOW_CONNECT_TIMEOUT_MS
+                ? connectTimeoutMs : FOLLOW_CONNECT_TIMEOUT_MS;
+        int readTimeoutMs;
+        TriCore fresh;
+        try {
+            readTimeoutMs = socket.getSoTimeout();
+            // The leader's certificate is checked against the name the hint gives.
+            TlsOptions leaderTls = tls == null ? null : tls.forServer(host);
+            fresh = connect(host, port, authUser, authSecret, clientName, budget, leaderTls,
+                    readTimeoutMs, features);
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+        Socket old = socket;
+        socket = fresh.socket;
+        in = fresh.in;
+        out = fresh.out;
+        sessionId = fresh.sessionId;
+        grantedFeatures = fresh.grantedFeatures;
+        address = target;
+        fresh.socket = null;
+        try {
+            old.close();
+        } catch (IOException ignored) {
+            // teardown of a connection that is no longer used
+        }
+        return true;
+    }
+
+    private static String joinAddress(String host, int port) {
+        return host.contains(":") ? "[" + host + "]:" + port : host + ":" + port;
+    }
+
+    private Response sendRequest(Map<String, Object> payload) {
         try {
             Frame f = exchange(REQUEST, payload);
             if (f.tag == ERROR) {

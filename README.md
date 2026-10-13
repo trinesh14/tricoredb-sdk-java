@@ -14,20 +14,20 @@ Maven:
 <dependency>
   <groupId>com.tricoredb</groupId>
   <artifactId>tricoredb</artifactId>
-  <version>0.2.0</version>
+  <version>0.3.0</version>
 </dependency>
 ```
 
 Gradle (Kotlin DSL):
 
 ```kotlin
-implementation("com.tricoredb:tricoredb:0.2.0")
+implementation("com.tricoredb:tricoredb:0.3.0")
 ```
 
 Gradle (Groovy):
 
 ```groovy
-implementation 'com.tricoredb:tricoredb:0.2.0'
+implementation 'com.tricoredb:tricoredb:0.3.0'
 ```
 
 Everything is in the package `com.tricoredb`, and the JPMS
@@ -215,6 +215,57 @@ db.cacheXAdd("events", "s1", List.of(CachePair.ofText("kind", "login")), null);
 ```java
 String ctx = db.llmContext(List.of(LlmSource.sql("SELECT id, name FROM users")));
 String schema = db.llmSchema();
+```
+
+## Operations added for server 0.1.0-rc.3
+
+These need `tricore-server` 0.1.0-rc.3 or later. An older server answers each
+of them with an error, raised as `TriCoreException`.
+
+- **Cache**: sorted sets (`cacheZAdd`, `cacheZRange`, `cacheZRangeByScore`,
+  ...), locks with fencing tokens (`cacheLockAcquire`, `cacheLockRenew`,
+  `cacheLockRelease`), bitmaps (`cacheSetBit` ... `cacheBitOp`), HyperLogLog
+  (`cachePfAdd`, `cachePfCount`, `cachePfMerge`), `cacheMGet` / `cacheMSet`,
+  `cacheSetIf`, `cacheCompareAndSwap`, `cacheGetDel`, `cacheGetSet`,
+  `cacheGetEx`, stale-while-revalidate reads (`cacheSetFresh`,
+  `cacheGetFresh`), blocking pops (`cacheBLPop`, `cacheBRPop`), set algebra
+  (`cacheSUnion`, `cacheSInter`, `cacheSDiff`), pipelines, transactions and
+  scripts built from `CacheCommand`, and Pub/Sub by polling (`cachePublish`,
+  `cachePoll`).
+- **Documents**: `documentReplace`, `documentInsertMany`,
+  `documentDeleteMany`, `documentBulkWrite` with `BulkOp`, `documentExplain`,
+  collection options (a schema, defaults and versions, as
+  `CollectionOptions`), and transactions spanning requests.
+- **Vectors**: `vectorUpsertMany`, `vectorSearchBatch`, `vectorSearchMulti`,
+  `vectorSearchByExamples`, filters (`vectorCount`, `vectorDeleteByFilter`,
+  `vectorUpdateByFilter`), named vectors, aliases, the built-in embedder
+  (`vectorEmbed`, `vectorUpsertText`) and index maintenance.
+- **Graph**: `graphAddMany` / `graphRemoveMany`, in-place updates, `graphDfs`,
+  `graphSubgraph`, `graphKShortestPaths`, `graphAllPaths`, algorithms
+  (components, cycles, centrality, communities, triangles, similarity,
+  PageRank), indexes and constraints with `graphFindNodes`, Cypher writes
+  through `graphExecute`, and graph transactions.
+
+```java
+db.cacheZAdd("game", "board", List.of(ScoredMember.ofText(120, "asha"), ScoredMember.ofText(95, "ravi")));
+List<CacheZMember> top = db.cacheZRange("game", "board", 0, 9, true, true);
+
+db.documentBulkWrite("people", List.of(
+        BulkOp.insert("u3", Map.of("name", "Mina")),
+        BulkOp.updateOne("u1", DocumentUpdate.inc("age", 1)),
+        BulkOp.delete("u2")));
+```
+
+A document or graph transaction is named by an id, and a request runs inside
+it when it carries that id. `setRequestTxn` puts the id on every request the
+connection sends until the transaction ends:
+
+```java
+String txn = db.documentBeginTransaction();
+db.setRequestTxn(txn);
+db.documentInsert("orders", "o1", Map.of("sku", "sku-1"));
+db.documentUpdateOne("stock", "sku-1", DocumentUpdate.inc("held", 1), false);
+db.documentCommitTransaction(txn);   // clears the request transaction
 ```
 
 ## Errors and leader redirects

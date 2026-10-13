@@ -5,6 +5,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalDouble;
+import java.util.OptionalLong;
+import java.util.function.Function;
 
 /**
  * Decoding helpers shared by the document/vector/graph methods.
@@ -53,6 +56,22 @@ final class Wire {
             return v == null ? Optional.empty() : Optional.of(bytes(v, "cache value"));
         }
         throw new ProtocolException("expected CacheValue, got " + describe(data));
+    }
+
+    /**
+     * The {@code CacheValues} payload: one entry per requested key, in the order
+     * asked, empty where the key was absent or expired.
+     */
+    static List<Optional<byte[]>> cacheValues(Response resp) {
+        Object data = resp.data();
+        if (data instanceof Map<?, ?> m && m.get("CacheValues") instanceof List<?> values) {
+            List<Optional<byte[]>> out = new ArrayList<>(values.size());
+            for (Object v : values) {
+                out.add(v == null ? Optional.empty() : Optional.of(bytes(v, "cache value")));
+            }
+            return out;
+        }
+        throw new ProtocolException("expected CacheValues, got " + describe(data));
     }
 
     /** A wire byte array (a JSON array of small integers) back to bytes. */
@@ -178,6 +197,30 @@ final class Wire {
         return out;
     }
 
+    /** A number the server sends as null, or leaves out, when there is none. */
+    static OptionalLong optLong(Map<String, Object> m, String key) {
+        return m.get(key) instanceof Number n ? OptionalLong.of(n.longValue()) : OptionalLong.empty();
+    }
+
+    static OptionalDouble optDbl(Map<String, Object> m, String key) {
+        return m.get(key) instanceof Number n ? OptionalDouble.of(n.doubleValue()) : OptionalDouble.empty();
+    }
+
+    /** A nested object field, or {@code null} when it is absent or not an object. */
+    static Map<String, Object> optObj(Map<String, Object> m, String key) {
+        return m.get(key) instanceof Map<?, ?> ? cast(m.get(key)) : null;
+    }
+
+    /** A list field of objects, each decoded by {@code from}. */
+    static <T> List<T> records(Map<String, Object> m, String key, Function<Map<String, Object>, T> from) {
+        List<Object> raw = list(m, key);
+        List<T> out = new ArrayList<>(raw.size());
+        for (Object o : raw) {
+            out.add(from.apply(asObject(o, key + " element")));
+        }
+        return out;
+    }
+
     // -- encoding helpers ------------------------------------------------------
 
     /** Wrap a core op under its family tag, e.g. {@code {"Vector": {"Get": ...}}}. */
@@ -205,6 +248,69 @@ final class Wire {
             out.add(f);
         }
         return out;
+    }
+
+    /**
+     * A list argument on the wire. A {@code null} list is sent empty, which is
+     * the server's own default for a list field.
+     */
+    static <T> List<Object> wireList(List<T> values, Function<T, Object> wire, String name) {
+        List<Object> out = new ArrayList<>();
+        if (values == null) {
+            return out;
+        }
+        for (T v : values) {
+            if (v == null) {
+                throw new IllegalArgumentException(name + " must not contain null");
+            }
+            out.add(wire.apply(v));
+        }
+        return out;
+    }
+
+    static Map<String, Object> vectorMap(Map<String, float[]> vectors) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Map.Entry<String, float[]> e : vectors.entrySet()) {
+            out.put(e.getKey(), vectorOf(e.getValue()));
+        }
+        return out;
+    }
+
+    /** An {@code Option<(a, b)>} field: both ends or neither. */
+    static List<Object> pair(Long first, Long second, String name) {
+        if (first == null && second == null) {
+            return null;
+        }
+        if (first == null || second == null) {
+            throw new IllegalArgumentException(name + " needs both of its values, or neither");
+        }
+        return List.of(first, second);
+    }
+
+    static Object nodeInput(GraphNode n) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", n.id());
+        m.put("labels", n.labels() == null ? List.of() : n.labels());
+        m.put("properties", n.properties() == null ? Map.of() : n.properties());
+        return m;
+    }
+
+    static Object edgeInput(GraphEdge e) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", e.id());
+        m.put("from", e.from());
+        m.put("to", e.to());
+        m.put("label", e.label());
+        m.put("properties", e.properties() == null ? Map.of() : e.properties());
+        return m;
+    }
+
+    static Object itemInput(VectorItem v) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", v.id());
+        m.put("vector", vectorOf(v.vector()));
+        m.put("metadata", v.metadata() == null ? Map.of() : v.metadata());
+        return m;
     }
 
     static String describe(Object v) {

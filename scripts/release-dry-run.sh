@@ -7,4 +7,4 @@ if [ -n "${TRICORE_SERVER_BIN:-}" ]; then
 else
   ./mvnw -B -DskipTests=false verify
 fi
-ls -l target/tricoredb-0.1.0*.jar
+ls -l target/tricoredb-0.3.0*.jar

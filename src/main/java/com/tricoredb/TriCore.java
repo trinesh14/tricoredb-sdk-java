@@ -17,6 +17,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalDouble;
 import java.util.OptionalLong;
 import java.util.function.Consumer;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -53,7 +54,7 @@ public final class TriCore implements AutoCloseable {
      * major. The two move for different reasons, and collapsing them would make
      * one a silent proxy for the other.
      */
-    public static final String SDK_VERSION = "0.2.0";
+    public static final String SDK_VERSION = "0.3.0";
 
     /**
      * This SDK understands a request-scoped correlation id, which the server
@@ -244,6 +245,7 @@ public final class TriCore implements AutoCloseable {
     private final String ridPrefix = nextConnectionPrefix();
     private String sessionId;
     private Long requestTimeoutMs;
+    private String requestTxn;
     private String lastRequestId;
 
     // True from a successful begin() until the block ends. See inTransaction().
@@ -594,8 +596,31 @@ public final class TriCore implements AutoCloseable {
         this.sessionId = sid == null ? null : String.valueOf(sid);
     }
 
+    /**
+     * Run every subsequent request inside a document or graph transaction, or
+     * pass {@code null} to stop doing so.
+     *
+     * <p>Give it the id {@link #documentBeginTransaction()} or
+     * {@link #graphBeginTransaction(String)} returned and each later request
+     * carries it, so it reads and writes inside that transaction. Committing or
+     * rolling that transaction back clears it.
+     */
+    public void setRequestTxn(String txn) {
+        this.requestTxn = txn;
+    }
+
+    /** The transaction requests currently run inside, or {@code null}. */
+    public String requestTxn() {
+        return requestTxn;
+    }
+
     /** Send a raw operation. The typed helpers below all funnel through this. */
     public Response request(Map<String, Object> op, String database) {
+        return request(op, database, requestTxn);
+    }
+
+    /** Send an operation inside the transaction {@code txn}, whatever {@link #requestTxn()} says. */
+    Response request(Map<String, Object> op, String database, String txn) {
         requestCounter++;
         // See nextConnectionPrefix: the prefix is what keeps a CANCEL naming one
         // statement rather than every connection's Nth statement.
@@ -608,9 +633,14 @@ public final class TriCore implements AutoCloseable {
         // A server-side deadline, distinct from the socket timeout: this one
         // makes the *server* stop, rather than abandoning the read on this side
         // while the work carries on.
-        if (requestTimeoutMs != null) {
+        if (requestTimeoutMs != null || txn != null) {
             Map<String, Object> options = new LinkedHashMap<>();
-            options.put("timeout_ms", requestTimeoutMs);
+            if (requestTimeoutMs != null) {
+                options.put("timeout_ms", requestTimeoutMs);
+            }
+            if (txn != null) {
+                options.put("txn", txn);
+            }
             payload.put("options", options);
         }
         long pause = leaderRetryDelayMs;
@@ -1206,6 +1236,970 @@ public final class TriCore implements AutoCloseable {
         return Wire.num(Wire.json(request(Wire.op("Cache", "XTrim", body), "main")), "trimmed");
     }
 
+    // -- cache: added for server 0.1.0-rc.3 -----------------------------------
+    //
+    // An older server answers each of these with an error naming the unknown
+    // operation.
+
+    /**
+     * Write a value that answers as fresh for freshMs milliseconds and as stale after
+     * that, until its TTL (if any) ends. Returns the instant, in Unix milliseconds,
+     * until which the value is fresh.
+     *
+     * <p>{@code ttlMs} may be {@code null}.
+     */
+    public long cacheSetFresh(String namespace, String key, byte[] value, long freshMs, Long ttlMs,
+                              String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("value", requireNotNull(value, "value"));
+        body.put("fresh_ms", freshMs);
+        body.put("ttl_ms", ttlMs);
+        return Wire.num(Wire.json(request(Wire.op("Cache", "SetFresh", body), database)), "freshUntilMs");
+    }
+
+    public long cacheSetFresh(String namespace, String key, byte[] value, long freshMs, Long ttlMs) {
+        return cacheSetFresh(namespace, key, value, freshMs, ttlMs, "main");
+    }
+
+    public long cacheSetFresh(String namespace, String key, byte[] value, long freshMs) {
+        return cacheSetFresh(namespace, key, value, freshMs, null, "main");
+    }
+
+    /**
+     * Read with stale-while-revalidate and stampede protection. The state is fresh,
+     * stale (with refresh set for the one caller holding the refresh lease), missing (a
+     * cached absence) or miss (with lease set for the one caller that should compute
+     * the value).
+     */
+    public CacheFreshRead cacheGetFresh(String namespace, String key, String owner, long leaseMs,
+                                        String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("owner", require(owner, "owner"));
+        body.put("lease_ms", leaseMs);
+        return CacheFreshRead.from(Wire.json(request(Wire.op("Cache", "GetFresh", body), database)));
+    }
+
+    public CacheFreshRead cacheGetFresh(String namespace, String key, String owner, long leaseMs) {
+        return cacheGetFresh(namespace, key, owner, leaseMs, "main");
+    }
+
+    /**
+     * Negative caching: remember for ttlMs milliseconds that the source has no value
+     * for the key.
+     */
+    public void cacheSetMissing(String namespace, String key, long ttlMs, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("ttl_ms", ttlMs);
+        request(Wire.op("Cache", "SetMissing", body), database);
+    }
+
+    public void cacheSetMissing(String namespace, String key, long ttlMs) {
+        cacheSetMissing(namespace, key, ttlMs, "main");
+    }
+
+    /**
+     * Cache warming: write the entries that are not already cached, leaving live values
+     * alone.
+     *
+     * <p>{@code ttlMs} may be {@code null}.
+     */
+    public CacheWarmResult cacheWarm(String namespace, List<CacheEntry> entries, Long ttlMs, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("entries", Wire.wireList(requireNotNull(entries, "entries"), CacheEntry::wire, "entries"));
+        body.put("ttl_ms", ttlMs);
+        return CacheWarmResult.from(Wire.json(request(Wire.op("Cache", "Warm", body), database)));
+    }
+
+    public CacheWarmResult cacheWarm(String namespace, List<CacheEntry> entries, Long ttlMs) {
+        return cacheWarm(namespace, entries, ttlMs, "main");
+    }
+
+    public CacheWarmResult cacheWarm(String namespace, List<CacheEntry> entries) {
+        return cacheWarm(namespace, entries, null, "main");
+    }
+
+    /**
+     * Read many values in one request. Answers positionally, one result per requested
+     * key, with an absent value where the key is missing or expired. One round trip,
+     * not a snapshot.
+     */
+    public List<Optional<byte[]>> cacheMGet(String namespace, List<String> keys, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("keys", Wire.wireList(requireNotNull(keys, "keys"), x -> x, "keys"));
+        return Wire.cacheValues(request(Wire.op("Cache", "MGet", body), database));
+    }
+
+    public List<Optional<byte[]>> cacheMGet(String namespace, List<String> keys) {
+        return cacheMGet(namespace, keys, "main");
+    }
+
+    /**
+     * Write many values in one request, all with the same optional TTL, as one batch. A
+     * repeated key is refused. Returns how many values were written.
+     *
+     * <p>{@code ttlMs} may be {@code null}.
+     */
+    public long cacheMSet(String namespace, List<CacheEntry> entries, Long ttlMs, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("entries", Wire.wireList(requireNotNull(entries, "entries"), CacheEntry::wire, "entries"));
+        body.put("ttl_ms", ttlMs);
+        return Wire.num(Wire.json(request(Wire.op("Cache", "MSet", body), database)), "set");
+    }
+
+    public long cacheMSet(String namespace, List<CacheEntry> entries, Long ttlMs) {
+        return cacheMSet(namespace, entries, ttlMs, "main");
+    }
+
+    public long cacheMSet(String namespace, List<CacheEntry> entries) {
+        return cacheMSet(namespace, entries, null, "main");
+    }
+
+    /**
+     * Write a value under a condition, with explicit control over the TTL: the general
+     * form of Set and SetNx. Returns false when the condition was not met, which is not
+     * a failure.
+     */
+    public boolean cacheSetIf(String namespace, String key, byte[] value, CacheSetCondition condition,
+                              CacheExpiry expiry, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("value", requireNotNull(value, "value"));
+        body.put("condition", requireNotNull(condition, "condition").wire());
+        body.put("expiry", requireNotNull(expiry, "expiry").wire());
+        return Wire.bool(Wire.json(request(Wire.op("Cache", "SetIf", body), database)), "set");
+    }
+
+    public boolean cacheSetIf(String namespace, String key, byte[] value, CacheSetCondition condition,
+                              CacheExpiry expiry) {
+        return cacheSetIf(namespace, key, value, condition, expiry, "main");
+    }
+
+    /**
+     * Add scored members to a sorted set, or re-score ones already there. A NaN score
+     * is refused.
+     */
+    public CacheZAddResult cacheZAdd(String namespace, String key, List<ScoredMember> members,
+                                     String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("members", Wire.wireList(requireNotNull(members, "members"), ScoredMember::wire, "members"));
+        return CacheZAddResult.from(Wire.json(request(Wire.op("Cache", "ZAdd", body), database)));
+    }
+
+    public CacheZAddResult cacheZAdd(String namespace, String key, List<ScoredMember> members) {
+        return cacheZAdd(namespace, key, members, "main");
+    }
+
+    /**
+     * Remove members from a sorted set. Returns how many were present.
+     */
+    public long cacheZRem(String namespace, String key, List<byte[]> members, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("members", requireNonEmpty(members, "members"));
+        return Wire.num(Wire.json(request(Wire.op("Cache", "ZRem", body), database)), "removed");
+    }
+
+    public long cacheZRem(String namespace, String key, List<byte[]> members) {
+        return cacheZRem(namespace, key, members, "main");
+    }
+
+    /**
+     * The score of one member, or absent when it is not in the set.
+     */
+    public OptionalDouble cacheZScore(String namespace, String key, byte[] member, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("member", requireNotNull(member, "member"));
+        return Wire.optDbl(Wire.json(request(Wire.op("Cache", "ZScore", body), database)), "score");
+    }
+
+    public OptionalDouble cacheZScore(String namespace, String key, byte[] member) {
+        return cacheZScore(namespace, key, member, "main");
+    }
+
+    /**
+     * How many members the sorted set holds.
+     */
+    public long cacheZCard(String namespace, String key, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        return Wire.num(Wire.json(request(Wire.op("Cache", "ZCard", body), database)), "cardinality");
+    }
+
+    public long cacheZCard(String namespace, String key) {
+        return cacheZCard(namespace, key, "main");
+    }
+
+    /**
+     * A member's position in the ordering, or absent when it is not in the set. With
+     * rev, counting starts from the high-scoring end.
+     */
+    public OptionalLong cacheZRank(String namespace, String key, byte[] member, boolean rev, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("member", requireNotNull(member, "member"));
+        body.put("rev", rev);
+        return Wire.optLong(Wire.json(request(Wire.op("Cache", "ZRank", body), database)), "rank");
+    }
+
+    public OptionalLong cacheZRank(String namespace, String key, byte[] member, boolean rev) {
+        return cacheZRank(namespace, key, member, rev, "main");
+    }
+
+    /**
+     * Members by rank, start to stop inclusive. Negative indices count from the end, so
+     * 0 to -1 is the whole set. Each member carries its score only when withScores is
+     * set.
+     */
+    public List<CacheZMember> cacheZRange(String namespace, String key, long start, long stop, boolean rev,
+                                          boolean withScores, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("start", start);
+        body.put("stop", stop);
+        body.put("rev", rev);
+        body.put("with_scores", withScores);
+        return CacheZMember.decode(Wire.list(Wire.json(
+                request(Wire.op("Cache", "ZRange", body), database)), "members"));
+    }
+
+    public List<CacheZMember> cacheZRange(String namespace, String key, long start, long stop, boolean rev,
+                                          boolean withScores) {
+        return cacheZRange(namespace, key, start, stop, rev, withScores, "main");
+    }
+
+    /**
+     * Members by score, between two bounds. The limit offset and count are applied
+     * after the range is selected; give both or neither.
+     *
+     * <p>Each of {@code limitOffset}, {@code limitCount} may be {@code null}.
+     */
+    public List<CacheZMember> cacheZRangeByScore(String namespace, String key, ScoreBound min,
+                                                 ScoreBound max, boolean rev, boolean withScores,
+                                                 Long limitOffset, Long limitCount, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("min", requireNotNull(min, "min").wire());
+        body.put("max", requireNotNull(max, "max").wire());
+        body.put("rev", rev);
+        body.put("with_scores", withScores);
+        body.put("limit", Wire.pair(limitOffset, limitCount, "limit"));
+        return CacheZMember.decode(Wire.list(Wire.json(
+                request(Wire.op("Cache", "ZRangeByScore", body), database)), "members"));
+    }
+
+    public List<CacheZMember> cacheZRangeByScore(String namespace, String key, ScoreBound min,
+                                                 ScoreBound max, boolean rev, boolean withScores,
+                                                 Long limitOffset, Long limitCount) {
+        return cacheZRangeByScore(namespace, key, min, max, rev, withScores, limitOffset, limitCount, "main");
+    }
+
+    public List<CacheZMember> cacheZRangeByScore(String namespace, String key, ScoreBound min,
+                                                 ScoreBound max, boolean rev, boolean withScores) {
+        return cacheZRangeByScore(namespace, key, min, max, rev, withScores, null, null, "main");
+    }
+
+    /**
+     * Add by to a member's score, creating the member at by when it is absent. Returns
+     * the resulting score.
+     */
+    public double cacheZIncrBy(String namespace, String key, byte[] member, double by, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("member", requireNotNull(member, "member"));
+        body.put("by", by);
+        return Wire.dbl(Wire.json(request(Wire.op("Cache", "ZIncrBy", body), database)), "score");
+    }
+
+    public double cacheZIncrBy(String namespace, String key, byte[] member, double by) {
+        return cacheZIncrBy(namespace, key, member, by, "main");
+    }
+
+    /**
+     * Take a lease on a lock, or refresh one already held by owner. The fencing token
+     * strictly increases with every acquisition and is never reused; acquiring a lock
+     * you already hold returns the same token with a refreshed lease.
+     */
+    public CacheLock cacheLockAcquire(String namespace, String key, String owner, long ttlMs,
+                                      String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("owner", require(owner, "owner"));
+        body.put("ttl_ms", ttlMs);
+        return CacheLock.from(Wire.json(request(Wire.op("Cache", "LockAcquire", body), database)));
+    }
+
+    public CacheLock cacheLockAcquire(String namespace, String key, String owner, long ttlMs) {
+        return cacheLockAcquire(namespace, key, owner, ttlMs, "main");
+    }
+
+    /**
+     * Extend a lease the caller still holds. Refused once the lease has lapsed, even if
+     * nobody else has taken the lock.
+     */
+    public CacheLockRenewal cacheLockRenew(String namespace, String key, String owner, long ttlMs,
+                                           String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("owner", require(owner, "owner"));
+        body.put("ttl_ms", ttlMs);
+        return CacheLockRenewal.from(Wire.json(request(Wire.op("Cache", "LockRenew", body), database)));
+    }
+
+    public CacheLockRenewal cacheLockRenew(String namespace, String key, String owner, long ttlMs) {
+        return cacheLockRenew(namespace, key, owner, ttlMs, "main");
+    }
+
+    /**
+     * Give up a lock. Only the current, live holder can release; returns whether this
+     * call released it.
+     */
+    public boolean cacheLockRelease(String namespace, String key, String owner, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("owner", require(owner, "owner"));
+        return Wire.bool(Wire.json(request(Wire.op("Cache", "LockRelease", body), database)), "released");
+    }
+
+    public boolean cacheLockRelease(String namespace, String key, String owner) {
+        return cacheLockRelease(namespace, key, owner, "main");
+    }
+
+    /**
+     * Set one bit of a string value, growing it with zero bytes if needed. Bits are
+     * numbered from the most significant bit of byte 0. Returns the bit's previous
+     * value.
+     */
+    public boolean cacheSetBit(String namespace, String key, long offset, boolean value, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("offset", offset);
+        body.put("value", value);
+        return Wire.num(Wire.json(request(Wire.op("Cache", "SetBit", body), database)), "previous") != 0;
+    }
+
+    public boolean cacheSetBit(String namespace, String key, long offset, boolean value) {
+        return cacheSetBit(namespace, key, offset, value, "main");
+    }
+
+    /**
+     * Read one bit. Past the end of the value, and on a missing key, every bit is 0.
+     */
+    public boolean cacheGetBit(String namespace, String key, long offset, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("offset", offset);
+        return Wire.num(Wire.json(request(Wire.op("Cache", "GetBit", body), database)), "bit") != 0;
+    }
+
+    public boolean cacheGetBit(String namespace, String key, long offset) {
+        return cacheGetBit(namespace, key, offset, "main");
+    }
+
+    /**
+     * Count the set bits, optionally within a byte range (not a bit range) with signed
+     * indices; give both ends or neither.
+     *
+     * <p>Each of {@code rangeStart}, {@code rangeEnd} may be {@code null}.
+     */
+    public long cacheBitCount(String namespace, String key, Long rangeStart, Long rangeEnd, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("range", Wire.pair(rangeStart, rangeEnd, "range"));
+        return Wire.num(Wire.json(request(Wire.op("Cache", "BitCount", body), database)), "count");
+    }
+
+    public long cacheBitCount(String namespace, String key, Long rangeStart, Long rangeEnd) {
+        return cacheBitCount(namespace, key, rangeStart, rangeEnd, "main");
+    }
+
+    public long cacheBitCount(String namespace, String key) {
+        return cacheBitCount(namespace, key, null, null, "main");
+    }
+
+    /**
+     * The position of the first bit equal to bit, optionally within a byte range, or -1
+     * when there is none.
+     *
+     * <p>Each of {@code rangeStart}, {@code rangeEnd} may be {@code null}.
+     */
+    public long cacheBitPos(String namespace, String key, boolean bit, Long rangeStart, Long rangeEnd,
+                            String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("bit", bit);
+        body.put("range", Wire.pair(rangeStart, rangeEnd, "range"));
+        return Wire.num(Wire.json(request(Wire.op("Cache", "BitPos", body), database)), "position");
+    }
+
+    public long cacheBitPos(String namespace, String key, boolean bit, Long rangeStart, Long rangeEnd) {
+        return cacheBitPos(namespace, key, bit, rangeStart, rangeEnd, "main");
+    }
+
+    public long cacheBitPos(String namespace, String key, boolean bit) {
+        return cacheBitPos(namespace, key, bit, null, null, "main");
+    }
+
+    /**
+     * Combine several values bitwise and store the result at dest. Shorter sources are
+     * zero-padded to the longest. Returns the result's size in bytes.
+     */
+    public long cacheBitOp(String namespace, CacheBitOp op, String dest, List<String> keys, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("op", requireNotNull(op, "op").wire());
+        body.put("dest", require(dest, "dest"));
+        body.put("keys", Wire.wireList(requireNotNull(keys, "keys"), x -> x, "keys"));
+        return Wire.num(Wire.json(request(Wire.op("Cache", "BitOp", body), database)), "length");
+    }
+
+    public long cacheBitOp(String namespace, CacheBitOp op, String dest, List<String> keys) {
+        return cacheBitOp(namespace, op, dest, keys, "main");
+    }
+
+    /**
+     * Add elements to a HyperLogLog, creating it when absent. Returns whether the
+     * estimate may have moved.
+     */
+    public boolean cachePfAdd(String namespace, String key, List<byte[]> elements, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("elements", requireNonEmpty(elements, "elements"));
+        return Wire.bool(Wire.json(request(Wire.op("Cache", "PfAdd", body), database)), "changed");
+    }
+
+    public boolean cachePfAdd(String namespace, String key, List<byte[]> elements) {
+        return cachePfAdd(namespace, key, elements, "main");
+    }
+
+    /**
+     * Estimated number of distinct elements. With several keys, the estimate is of
+     * their union, computed without modifying any of them.
+     */
+    public long cachePfCount(String namespace, List<String> keys, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("keys", Wire.wireList(requireNotNull(keys, "keys"), x -> x, "keys"));
+        return Wire.num(Wire.json(request(Wire.op("Cache", "PfCount", body), database)), "count");
+    }
+
+    public long cachePfCount(String namespace, List<String> keys) {
+        return cachePfCount(namespace, keys, "main");
+    }
+
+    /**
+     * Merge several HyperLogLogs into dest, which is included as a source when it
+     * already exists.
+     */
+    public void cachePfMerge(String namespace, String dest, List<String> sources, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("dest", require(dest, "dest"));
+        body.put("sources", Wire.wireList(requireNotNull(sources, "sources"), x -> x, "sources"));
+        request(Wire.op("Cache", "PfMerge", body), database);
+    }
+
+    public void cachePfMerge(String namespace, String dest, List<String> sources) {
+        cachePfMerge(namespace, dest, sources, "main");
+    }
+
+    /**
+     * Atomically pop an element from one end of source and push it onto one end of
+     * destination. Returns the element, or absent when source is empty. The two keys
+     * may be the same, which rotates the list.
+     */
+    public Optional<byte[]> cacheLMove(String namespace, String source, String destination,
+                                       CacheListEnd from, CacheListEnd to, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("source", require(source, "source"));
+        body.put("destination", require(destination, "destination"));
+        body.put("from", requireNotNull(from, "from").wire());
+        body.put("to", requireNotNull(to, "to").wire());
+        return Wire.cacheValue(request(Wire.op("Cache", "LMove", body), database));
+    }
+
+    public Optional<byte[]> cacheLMove(String namespace, String source, String destination,
+                                       CacheListEnd from, CacheListEnd to) {
+        return cacheLMove(namespace, source, destination, from, to, "main");
+    }
+
+    /**
+     * Set the absolute instant an existing live key dies, in Unix epoch milliseconds. A
+     * deadline already passed deletes the key; a missing or expired key is not created.
+     */
+    public CacheExpireAtResult cacheExpireAt(String namespace, String key, long atMs, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("at_ms", atMs);
+        return CacheExpireAtResult.from(Wire.json(request(Wire.op("Cache", "ExpireAt", body), database)));
+    }
+
+    public CacheExpireAtResult cacheExpireAt(String namespace, String key, long atMs) {
+        return cacheExpireAt(namespace, key, atMs, "main");
+    }
+
+    /**
+     * What this node's cache is doing: lookup hits and misses, the memory budget and
+     * the eviction policy. Node-wide, not per database. Returned as the server's own
+     * JSON object.
+     */
+    public Map<String, Object> cacheStats(String database) {
+        return Wire.json(request(Wire.unitOp("Cache", "Stats"), database));
+    }
+
+    public Map<String, Object> cacheStats() {
+        return cacheStats("main");
+    }
+
+    /**
+     * Delete every cache key in this database, across every namespace. Returns how many
+     * keys were removed.
+     */
+    public long cacheFlushDatabase(String database) {
+        return Wire.num(Wire.json(request(Wire.unitOp("Cache", "FlushDatabase"), database)), "cleared");
+    }
+
+    public long cacheFlushDatabase() {
+        return cacheFlushDatabase("main");
+    }
+
+    /**
+     * Concatenate bytes onto what a key already holds and return the new length. A
+     * missing key is created; an existing key keeps its expiry.
+     */
+    public long cacheAppend(String namespace, String key, byte[] value, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("value", requireNotNull(value, "value"));
+        return Wire.num(Wire.json(request(Wire.op("Cache", "Append", body), database)), "length");
+    }
+
+    public long cacheAppend(String namespace, String key, byte[] value) {
+        return cacheAppend(namespace, key, value, "main");
+    }
+
+    /**
+     * Write only if the key still holds what the caller last read. An absent expected
+     * requires the key to be absent, and an absent value deletes it. On a mismatch
+     * nothing is written and the result carries the value actually present when it is
+     * valid UTF-8.
+     *
+     * <p>Each of {@code expected}, {@code value}, {@code ttlMs} may be {@code null}.
+     */
+    public CacheSwapResult cacheCompareAndSwap(String namespace, String key, byte[] expected, byte[] value,
+                                               Long ttlMs, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("expected", expected);
+        body.put("value", value);
+        body.put("ttl_ms", ttlMs);
+        return CacheSwapResult.from(Wire.json(request(Wire.op("Cache", "CompareAndSwap", body), database)));
+    }
+
+    public CacheSwapResult cacheCompareAndSwap(String namespace, String key, byte[] expected, byte[] value,
+                                               Long ttlMs) {
+        return cacheCompareAndSwap(namespace, key, expected, value, ttlMs, "main");
+    }
+
+    public CacheSwapResult cacheCompareAndSwap(String namespace, String key, byte[] expected, byte[] value) {
+        return cacheCompareAndSwap(namespace, key, expected, value, null, "main");
+    }
+
+    /**
+     * Read a key and delete it in one atomic step. Returns the value that was removed,
+     * or absent.
+     */
+    public Optional<byte[]> cacheGetDel(String namespace, String key, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        return Wire.cacheValue(request(Wire.op("Cache", "GetDel", body), database));
+    }
+
+    public Optional<byte[]> cacheGetDel(String namespace, String key) {
+        return cacheGetDel(namespace, key, "main");
+    }
+
+    /**
+     * Write a value and return the one it replaced, atomically. Any TTL on the old
+     * value is dropped; pass ttlMs to set one.
+     *
+     * <p>{@code ttlMs} may be {@code null}.
+     */
+    public Optional<byte[]> cacheGetSet(String namespace, String key, byte[] value, Long ttlMs,
+                                        String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("value", requireNotNull(value, "value"));
+        body.put("ttl_ms", ttlMs);
+        return Wire.cacheValue(request(Wire.op("Cache", "GetSet", body), database));
+    }
+
+    public Optional<byte[]> cacheGetSet(String namespace, String key, byte[] value, Long ttlMs) {
+        return cacheGetSet(namespace, key, value, ttlMs, "main");
+    }
+
+    public Optional<byte[]> cacheGetSet(String namespace, String key, byte[] value) {
+        return cacheGetSet(namespace, key, value, null, "main");
+    }
+
+    /**
+     * Read a key and change its expiry in the same atomic step. The value itself is
+     * never modified.
+     */
+    public Optional<byte[]> cacheGetEx(String namespace, String key, CacheExpiry expiry, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("expiry", requireNotNull(expiry, "expiry").wire());
+        return Wire.cacheValue(request(Wire.op("Cache", "GetEx", body), database));
+    }
+
+    public Optional<byte[]> cacheGetEx(String namespace, String key, CacheExpiry expiry) {
+        return cacheGetEx(namespace, key, expiry, "main");
+    }
+
+    /**
+     * Keep only the inclusive index range of a list, dropping everything outside it.
+     * Negative indices count from the end; a range selecting nothing deletes the key.
+     */
+    public CacheTrimResult cacheLTrim(String namespace, String key, long start, long stop, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("start", start);
+        body.put("stop", stop);
+        return CacheTrimResult.from(Wire.json(request(Wire.op("Cache", "LTrim", body), database)));
+    }
+
+    public CacheTrimResult cacheLTrim(String namespace, String key, long start, long stop) {
+        return cacheLTrim(namespace, key, start, stop, "main");
+    }
+
+    /**
+     * Every member of every named set, without duplicates. A missing key is the empty
+     * set.
+     */
+    public List<byte[]> cacheSUnion(String namespace, List<String> keys, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("keys", Wire.wireList(requireNotNull(keys, "keys"), x -> x, "keys"));
+        return Wire.byteLists(Wire.json(request(Wire.op("Cache", "SUnion", body), database)), "members");
+    }
+
+    public List<byte[]> cacheSUnion(String namespace, List<String> keys) {
+        return cacheSUnion(namespace, keys, "main");
+    }
+
+    /**
+     * The members present in every named set. A missing key is the empty set, so the
+     * intersection is then empty.
+     */
+    public List<byte[]> cacheSInter(String namespace, List<String> keys, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("keys", Wire.wireList(requireNotNull(keys, "keys"), x -> x, "keys"));
+        return Wire.byteLists(Wire.json(request(Wire.op("Cache", "SInter", body), database)), "members");
+    }
+
+    public List<byte[]> cacheSInter(String namespace, List<String> keys) {
+        return cacheSInter(namespace, keys, "main");
+    }
+
+    /**
+     * The members of the first set that are in none of the rest.
+     */
+    public List<byte[]> cacheSDiff(String namespace, List<String> keys, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("keys", Wire.wireList(requireNotNull(keys, "keys"), x -> x, "keys"));
+        return Wire.byteLists(Wire.json(request(Wire.op("Cache", "SDiff", body), database)), "members");
+    }
+
+    public List<byte[]> cacheSDiff(String namespace, List<String> keys) {
+        return cacheSDiff(namespace, keys, "main");
+    }
+
+    /**
+     * Random members of a set, without removing them. An absent count gives at most one
+     * member, a positive count up to that many distinct members, and a negative count
+     * exactly that many with repeats allowed.
+     *
+     * <p>{@code count} may be {@code null}.
+     */
+    public List<byte[]> cacheSRandMember(String namespace, String key, Long count, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("count", count);
+        return Wire.byteLists(Wire.json(request(Wire.op("Cache", "SRandMember", body), database)), "members");
+    }
+
+    public List<byte[]> cacheSRandMember(String namespace, String key, Long count) {
+        return cacheSRandMember(namespace, key, count, "main");
+    }
+
+    public List<byte[]> cacheSRandMember(String namespace, String key) {
+        return cacheSRandMember(namespace, key, null, "main");
+    }
+
+    /**
+     * Add by to one hash field, atomically, and return the new value. A missing field
+     * starts at zero.
+     */
+    public long cacheHIncrBy(String namespace, String key, byte[] field, long by, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("key", require(key, "key"));
+        body.put("field", requireNotNull(field, "field"));
+        body.put("by", by);
+        return Wire.num(Wire.json(request(Wire.op("Cache", "HIncrBy", body), database)), "value");
+    }
+
+    public long cacheHIncrBy(String namespace, String key, byte[] field, long by) {
+        return cacheHIncrBy(namespace, key, field, by, "main");
+    }
+
+    /**
+     * Run commands in order in one round trip, each exactly as if it had been sent
+     * alone. A failing command does not stop the rest; each has its own result.
+     */
+    public List<CacheOpResult> cachePipeline(List<CacheCommand> ops, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("ops", Wire.wireList(requireNotNull(ops, "ops"), CacheCommand::wire, "ops"));
+        return CacheOpResult.decode(Wire.list(Wire.json(
+                request(Wire.op("Cache", "Pipeline", body), database)), "results"));
+    }
+
+    public List<CacheOpResult> cachePipeline(List<CacheCommand> ops) {
+        return cachePipeline(ops, "main");
+    }
+
+    /**
+     * Run commands in order holding the cache write lock throughout, so no other writer
+     * interleaves. Every command is checked before any runs; after that there is no
+     * rollback, and a command that fails is reported while the rest still run.
+     */
+    public List<CacheOpResult> cacheTransaction(List<CacheCommand> ops, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("ops", Wire.wireList(requireNotNull(ops, "ops"), CacheCommand::wire, "ops"));
+        return CacheOpResult.decode(Wire.list(Wire.json(
+                request(Wire.op("Cache", "Transaction", body), database)), "results"));
+    }
+
+    public List<CacheOpResult> cacheTransaction(List<CacheCommand> ops) {
+        return cacheTransaction(ops, "main");
+    }
+
+    /**
+     * Store a script: commands run as one transaction, in which any string or value
+     * written $1, $2 and so on is replaced by that argument at run time. Loading the
+     * same name again replaces it. Returns how many commands the script holds.
+     */
+    public long cacheScriptLoad(String name, List<CacheCommand> ops, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("name", require(name, "name"));
+        body.put("ops", Wire.wireList(requireNotNull(ops, "ops"), CacheCommand::wire, "ops"));
+        return Wire.num(Wire.json(request(Wire.op("Cache", "ScriptLoad", body), database)), "ops");
+    }
+
+    public long cacheScriptLoad(String name, List<CacheCommand> ops) {
+        return cacheScriptLoad(name, ops, "main");
+    }
+
+    /**
+     * Run a stored script with the given arguments as one transaction.
+     */
+    public List<CacheOpResult> cacheScriptRun(String name, List<String> args, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("name", require(name, "name"));
+        body.put("args", Wire.wireList(args, x -> x, "args"));
+        return CacheOpResult.decode(Wire.list(Wire.json(
+                request(Wire.op("Cache", "ScriptRun", body), database)), "results"));
+    }
+
+    public List<CacheOpResult> cacheScriptRun(String name, List<String> args) {
+        return cacheScriptRun(name, args, "main");
+    }
+
+    public List<CacheOpResult> cacheScriptRun(String name) {
+        return cacheScriptRun(name, List.of(), "main");
+    }
+
+    /**
+     * The most frequently addressed keys on this node since it started, with estimated
+     * counts. The server refuses this unless its cache hot_keys setting is above zero.
+     * Returned as the server's own JSON, undecoded.
+     *
+     * <p>{@code limit} may be {@code null}.
+     */
+    public Object cacheHotKeys(Integer limit, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("limit", limit);
+        return Wire.jsonOrNull(request(Wire.op("Cache", "HotKeys", body), database));
+    }
+
+    public Object cacheHotKeys(Integer limit) {
+        return cacheHotKeys(limit, "main");
+    }
+
+    public Object cacheHotKeys() {
+        return cacheHotKeys(null, "main");
+    }
+
+    /**
+     * Delete every expired cache key in this database now, rather than leaving it to
+     * compaction. Returns how many were purged.
+     */
+    public long cachePurgeExpired(String database) {
+        return Wire.num(Wire.json(request(Wire.unitOp("Cache", "PurgeExpired"), database)), "purged");
+    }
+
+    public long cachePurgeExpired() {
+        return cachePurgeExpired("main");
+    }
+
+    /**
+     * Pop the head of the first non-empty list among keys, waiting up to timeoutMs
+     * milliseconds for one to receive an element. Absent when the wait ran out. A
+     * connection read timeout must be longer than the wait.
+     */
+    public Optional<CachePopped> cacheBLPop(String namespace, List<String> keys, long timeoutMs,
+                                            String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("keys", Wire.wireList(requireNotNull(keys, "keys"), x -> x, "keys"));
+        body.put("timeout_ms", timeoutMs);
+        return CachePopped.decode(Wire.cacheValues(request(Wire.op("Cache", "BLPop", body), database)));
+    }
+
+    public Optional<CachePopped> cacheBLPop(String namespace, List<String> keys, long timeoutMs) {
+        return cacheBLPop(namespace, keys, timeoutMs, "main");
+    }
+
+    /**
+     * Pop the tail of the first non-empty list among keys, waiting up to timeoutMs
+     * milliseconds for one to receive an element. Absent when the wait ran out. A
+     * connection read timeout must be longer than the wait.
+     */
+    public Optional<CachePopped> cacheBRPop(String namespace, List<String> keys, long timeoutMs,
+                                            String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("keys", Wire.wireList(requireNotNull(keys, "keys"), x -> x, "keys"));
+        body.put("timeout_ms", timeoutMs);
+        return CachePopped.decode(Wire.cacheValues(request(Wire.op("Cache", "BRPop", body), database)));
+    }
+
+    public Optional<CachePopped> cacheBRPop(String namespace, List<String> keys, long timeoutMs) {
+        return cacheBRPop(namespace, keys, timeoutMs, "main");
+    }
+
+    /**
+     * Cap a namespace at maxKeys live keys and maxBytes of values. A write that would
+     * pass either is refused. Both absent removes the limit.
+     *
+     * <p>Each of {@code maxKeys}, {@code maxBytes} may be {@code null}.
+     */
+    public CacheNamespaceLimit cacheSetNamespaceLimit(String namespace, Long maxKeys, Long maxBytes,
+                                                      String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        body.put("max_keys", maxKeys);
+        body.put("max_bytes", maxBytes);
+        return CacheNamespaceLimit.from(Wire.json(
+                request(Wire.op("Cache", "SetNamespaceLimit", body), database)));
+    }
+
+    public CacheNamespaceLimit cacheSetNamespaceLimit(String namespace, Long maxKeys, Long maxBytes) {
+        return cacheSetNamespaceLimit(namespace, maxKeys, maxBytes, "main");
+    }
+
+    public CacheNamespaceLimit cacheSetNamespaceLimit(String namespace) {
+        return cacheSetNamespaceLimit(namespace, null, null, "main");
+    }
+
+    /**
+     * A namespace's limit and what it holds now.
+     */
+    public CacheNamespaceLimit cacheGetNamespaceLimit(String namespace, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("namespace", require(namespace, "namespace"));
+        return CacheNamespaceLimit.from(Wire.json(
+                request(Wire.op("Cache", "GetNamespaceLimit", body), database)));
+    }
+
+    public CacheNamespaceLimit cacheGetNamespaceLimit(String namespace) {
+        return cacheGetNamespaceLimit(namespace, "main");
+    }
+
+    /**
+     * Append a message to a channel (Pub/Sub). Returns the id the message was given.
+     */
+    public long cachePublish(String channel, String message, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("channel", require(channel, "channel"));
+        body.put("message", require(message, "message"));
+        return Wire.num(Wire.json(request(Wire.op("Cache", "Publish", body), database)), "id");
+    }
+
+    public long cachePublish(String channel, String message) {
+        return cachePublish(channel, message, "main");
+    }
+
+    /**
+     * The messages after id after on the given channels. A trailing * in a channel name
+     * is a pattern; the __keyspace__ and __keyevent__ prefixes turn keyspace
+     * notifications on while polled.
+     */
+    public CachePollResult cachePoll(List<String> channels, long after, int limit, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("channels", Wire.wireList(requireNotNull(channels, "channels"), x -> x, "channels"));
+        body.put("after", after);
+        body.put("limit", limit);
+        return CachePollResult.from(Wire.json(request(Wire.op("Cache", "Poll", body), database)));
+    }
+
+    public CachePollResult cachePoll(List<String> channels, long after, int limit) {
+        return cachePoll(channels, after, limit, "main");
+    }
+
+    public CachePollResult cachePoll(List<String> channels) {
+        return cachePoll(channels, 0L, 100, "main");
+    }
+
     private static Map<String, Object> keyBody(String namespace, String key) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("namespace", require(namespace, "namespace"));
@@ -1453,6 +2447,250 @@ public final class TriCore implements AutoCloseable {
         return documentAnalyze(collection, "main");
     }
 
+    // -- document: added for server 0.1.0-rc.3 --------------------------------
+    //
+    // An older server answers each of these with an error naming the unknown
+    // operation.
+
+    /**
+     * Swap a document's whole body for a new one: after a replace the stored body is
+     * exactly the document given, plus its id. With upsert, a missing document is
+     * created rather than refused. expectedVersion applies the write only if the
+     * document's version is still that (a versioned collection only).
+     *
+     * <p>{@code expectedVersion} may be {@code null}.
+     */
+    public DocumentReplaceResult documentReplace(String collection, String id,
+                                                 Map<String, Object> document, boolean upsert,
+                                                 ReturnDocument returnDocument, Long expectedVersion,
+                                                 String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("id", require(id, "id"));
+        body.put("document", requireNotNull(document, "document"));
+        body.put("upsert", upsert);
+        body.put("return", (returnDocument == null ? ReturnDocument.NONE : returnDocument).wire());
+        body.put("expected_version", expectedVersion);
+        return DocumentReplaceResult.from(Wire.json(request(Wire.op("Document", "Replace", body), database)));
+    }
+
+    public DocumentReplaceResult documentReplace(String collection, String id,
+                                                 Map<String, Object> document, boolean upsert,
+                                                 ReturnDocument returnDocument, Long expectedVersion) {
+        return documentReplace(collection, id, document, upsert, returnDocument, expectedVersion, "main");
+    }
+
+    public DocumentReplaceResult documentReplace(String collection, String id, Map<String, Object> document) {
+        return documentReplace(collection, id, document, false, ReturnDocument.NONE, null, "main");
+    }
+
+    /**
+     * Insert several documents as one atomic batch: either every document lands or none
+     * does. Each document's id is its own _id when it carries one and is generated
+     * otherwise. Returns the ids, in order.
+     */
+    public List<String> documentInsertMany(String collection, List<Map<String, Object>> documents,
+                                           String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("documents", Wire.wireList(requireNotNull(documents, "documents"), x -> x, "documents"));
+        return Wire.strings(Wire.json(request(Wire.op("Document", "InsertMany", body), database)), "ids");
+    }
+
+    public List<String> documentInsertMany(String collection, List<Map<String, Object>> documents) {
+        return documentInsertMany(collection, documents, "main");
+    }
+
+    /**
+     * Delete every document matching the filter, in one atomic batch. Returns how many
+     * were deleted.
+     */
+    public long documentDeleteMany(String collection, DocumentFilter filter, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("filter", requireNotNull(filter, "filter").wire());
+        return Wire.num(Wire.json(request(Wire.op("Document", "DeleteMany", body), database)), "deleted");
+    }
+
+    public long documentDeleteMany(String collection, DocumentFilter filter) {
+        return documentDeleteMany(collection, filter, "main");
+    }
+
+    /**
+     * Move a collection, with its documents and indexes, to a new name in one atomic
+     * batch. Refused when the new name already exists.
+     */
+    public void documentRenameCollection(String collection, String to, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("to", require(to, "to"));
+        request(Wire.op("Document", "RenameCollection", body), database);
+    }
+
+    public void documentRenameCollection(String collection, String to) {
+        documentRenameCollection(collection, to, "main");
+    }
+
+    /**
+     * Delete the documents a TTL index says have expired, now.
+     */
+    public DocumentPurgeResult documentPurgeExpired(String collection, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        return DocumentPurgeResult.from(Wire.json(
+                request(Wire.op("Document", "PurgeExpired", body), database)));
+    }
+
+    public DocumentPurgeResult documentPurgeExpired(String collection) {
+        return documentPurgeExpired(collection, "main");
+    }
+
+    /**
+     * Run a find and describe how it ran instead of returning its documents: the plan,
+     * the index, why it scanned, the estimate, records examined and returned, and the
+     * time taken. Returned as the server's own JSON object.
+     *
+     * <p>Each of {@code limit}, {@code skip} may be {@code null}.
+     */
+    public Map<String, Object> documentExplain(String collection, DocumentFilter filter, Integer limit,
+                                               List<AggregateStage.SortKey> sort, Integer skip,
+                                               String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("filter", requireNotNull(filter, "filter").wire());
+        body.put("limit", limit);
+        body.put("sort", Wire.wireList(sort, AggregateStage.SortKey::wire, "sort"));
+        body.put("skip", skip);
+        return Wire.json(request(Wire.op("Document", "Explain", body), database));
+    }
+
+    public Map<String, Object> documentExplain(String collection, DocumentFilter filter, Integer limit,
+                                               List<AggregateStage.SortKey> sort, Integer skip) {
+        return documentExplain(collection, filter, limit, sort, skip, "main");
+    }
+
+    public Map<String, Object> documentExplain(String collection, DocumentFilter filter) {
+        return documentExplain(collection, filter, null, List.of(), null, "main");
+    }
+
+    /**
+     * Open a transaction spanning requests and return its id. Each later request that
+     * carries the id reads and writes inside it, seeing its own writes and nobody
+     * else's since it began. Snapshot isolation, or serializable with its reads
+     * validated at commit.
+     */
+    public String documentBeginTransaction(boolean serializable, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("serializable", serializable);
+        return Wire.str(Wire.json(request(Wire.op("Document", "BeginTransaction", body), database)), "txn");
+    }
+
+    public String documentBeginTransaction(boolean serializable) {
+        return documentBeginTransaction(serializable, "main");
+    }
+
+    public String documentBeginTransaction() {
+        return documentBeginTransaction(false, "main");
+    }
+
+    /**
+     * Commit a transaction: every write lands as one atomic batch, or a conflict is
+     * returned and nothing lands. Returns how many writes were applied.
+     */
+    public long documentCommitTransaction(String txn, String database) {
+        try {
+            return Wire.num(Wire.json(request(Wire.unitOp("Document", "CommitTransaction"), database, require(txn, "txn"))), "writes");
+        } finally {
+            if (txn != null && txn.equals(requestTxn)) {
+                requestTxn = null;
+            }
+        }
+    }
+
+    public long documentCommitTransaction(String txn) {
+        return documentCommitTransaction(txn, "main");
+    }
+
+    /**
+     * Discard a transaction and everything written inside it.
+     */
+    public void documentRollbackTransaction(String txn, String database) {
+        try {
+            request(Wire.unitOp("Document", "RollbackTransaction"), database, require(txn, "txn"));
+        } finally {
+            if (txn != null && txn.equals(requestTxn)) {
+                requestTxn = null;
+            }
+        }
+    }
+
+    public void documentRollbackTransaction(String txn) {
+        documentRollbackTransaction(txn, "main");
+    }
+
+    /**
+     * Rebuild one index from the stored documents; its entries are replaced in one
+     * batch.
+     */
+    public DocumentIndexRebuild documentRebuildIndex(String collection, String indexName, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("index_name", require(indexName, "index_name"));
+        return DocumentIndexRebuild.from(Wire.json(
+                request(Wire.op("Document", "RebuildIndex", body), database)));
+    }
+
+    public DocumentIndexRebuild documentRebuildIndex(String collection, String indexName) {
+        return documentRebuildIndex(collection, indexName, "main");
+    }
+
+    /**
+     * Set a collection's options, replacing any it had. Refused when an existing
+     * document would break the new schema. Returns how many stored documents were
+     * checked.
+     */
+    public long documentSetCollectionOptions(String collection, CollectionOptions options, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("options", requireNotNull(options, "options").wire());
+        return Wire.num(Wire.json(
+                request(Wire.op("Document", "SetCollectionOptions", body), database)), "documents_checked");
+    }
+
+    public long documentSetCollectionOptions(String collection, CollectionOptions options) {
+        return documentSetCollectionOptions(collection, options, "main");
+    }
+
+    /**
+     * A collection's options: its schema, defaults and whether it keeps versions.
+     */
+    public CollectionOptions documentGetCollectionOptions(String collection, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        return CollectionOptions.from(Wire.obj(Wire.json(
+                request(Wire.op("Document", "GetCollectionOptions", body), database)), "options"));
+    }
+
+    public CollectionOptions documentGetCollectionOptions(String collection) {
+        return documentGetCollectionOptions(collection, "main");
+    }
+
+    /**
+     * Many inserts, updates, replaces and deletes on one collection, applied in order
+     * as one atomic batch: every operation lands or none does. A later operation sees
+     * the effect of an earlier one on the same id.
+     */
+    public BulkWriteResult documentBulkWrite(String collection, List<BulkOp> ops, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("ops", Wire.wireList(requireNotNull(ops, "ops"), BulkOp::wire, "ops"));
+        return BulkWriteResult.from(Wire.json(request(Wire.op("Document", "BulkWrite", body), database)));
+    }
+
+    public BulkWriteResult documentBulkWrite(String collection, List<BulkOp> ops) {
+        return documentBulkWrite(collection, ops, "main");
+    }
+
     // -- vector ------------------------------------------------------------------
 
     public void vectorCreateCollection(String collection, int dimension, VectorMetric metric,
@@ -1599,6 +2837,448 @@ public final class TriCore implements AutoCloseable {
 
     public void vectorDropCollection(String collection) {
         vectorDropCollection(collection, "main");
+    }
+
+    // -- vector: added for server 0.1.0-rc.3 ----------------------------------
+    //
+    // An older server answers each of these with an error naming the unknown
+    // operation.
+
+    /**
+     * Embed texts with the server's built-in embedder (deterministic feature hashing:
+     * lexical, no model) and return the vectors, one per text. Nothing is stored.
+     */
+    public List<float[]> vectorEmbed(List<String> texts, int dimension, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("texts", Wire.wireList(requireNotNull(texts, "texts"), x -> x, "texts"));
+        body.put("dimension", dimension);
+        List<float[]> out = new ArrayList<>();
+        for (Object o : Wire.list(Wire.json(request(Wire.op("Vector", "Embed", body), database)), "vectors")) {
+            out.add(Wire.floats(Map.of("vector", o), "vector"));
+        }
+        return out;
+    }
+
+    public List<float[]> vectorEmbed(List<String> texts, int dimension) {
+        return vectorEmbed(texts, dimension, "main");
+    }
+
+    /**
+     * Embed each text at the collection's dimension and upsert the vectors as one
+     * atomic batch. The text is kept in the metadata under text. Returns how many were
+     * written.
+     */
+    public long vectorUpsertText(String collection, List<VectorText> items, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("items", Wire.wireList(requireNotNull(items, "items"), VectorText::wire, "items"));
+        return Wire.num(Wire.json(request(Wire.op("Vector", "UpsertText", body), database)), "upserted");
+    }
+
+    public long vectorUpsertText(String collection, List<VectorText> items) {
+        return vectorUpsertText(collection, items, "main");
+    }
+
+    /**
+     * Point an alias at a collection; an absent collection removes the alias. Every
+     * operation naming the alias acts on the collection it points at.
+     *
+     * <p>{@code collection} may be {@code null}.
+     */
+    public void vectorSetAlias(String alias, String collection, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("alias", require(alias, "alias"));
+        body.put("collection", collection);
+        request(Wire.op("Vector", "SetAlias", body), database);
+    }
+
+    public void vectorSetAlias(String alias, String collection) {
+        vectorSetAlias(alias, collection, "main");
+    }
+
+    /**
+     * Every alias and the collection it names.
+     */
+    public List<VectorAlias> vectorListAliases(String database) {
+        List<VectorAlias> out = new ArrayList<>();
+        for (Object o : Wire.list(Wire.json(request(Wire.unitOp("Vector", "ListAliases"), database)), "aliases")) {
+            out.add(VectorAlias.from(Wire.asObject(o, "aliases")));
+        }
+        return out;
+    }
+
+    public List<VectorAlias> vectorListAliases() {
+        return vectorListAliases("main");
+    }
+
+    /**
+     * Declare a named vector on a collection: a second vector per item, with its own
+     * dimension and metric.
+     */
+    public void vectorAddNamedVector(String collection, String name, int dimension, VectorMetric metric,
+                                     String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("name", require(name, "name"));
+        body.put("dimension", dimension);
+        body.put("metric", requireNotNull(metric, "metric").wire());
+        request(Wire.op("Vector", "AddNamedVector", body), database);
+    }
+
+    public void vectorAddNamedVector(String collection, String name, int dimension, VectorMetric metric) {
+        vectorAddNamedVector(collection, name, dimension, metric, "main");
+    }
+
+    /**
+     * Write an item's vectors by name (default is the collection's own), each with the
+     * same metadata.
+     *
+     * <p>{@code metadata} may be {@code null}.
+     */
+    public void vectorUpsertNamed(String collection, String id, Map<String, float[]> vectors,
+                                  Map<String, Object> metadata, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("id", require(id, "id"));
+        body.put("vectors", Wire.vectorMap(requireNotNull(vectors, "vectors")));
+        if (metadata != null) {
+            body.put("metadata", metadata);
+        }
+        request(Wire.op("Vector", "UpsertNamed", body), database);
+    }
+
+    public void vectorUpsertNamed(String collection, String id, Map<String, float[]> vectors,
+                                  Map<String, Object> metadata) {
+        vectorUpsertNamed(collection, id, vectors, metadata, "main");
+    }
+
+    public void vectorUpsertNamed(String collection, String id, Map<String, float[]> vectors) {
+        vectorUpsertNamed(collection, id, vectors, null, "main");
+    }
+
+    /**
+     * Write many vectors in one request, as one atomic batch. Every item is validated
+     * before any is written, and a repeated id is refused. Returns how many were
+     * written.
+     */
+    public long vectorUpsertMany(String collection, List<VectorItem> items, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("items", Wire.wireList(requireNotNull(items, "items"), Wire::itemInput, "items"));
+        return Wire.num(Wire.json(request(Wire.op("Vector", "UpsertMany", body), database)), "upserted");
+    }
+
+    public long vectorUpsertMany(String collection, List<VectorItem> items) {
+        return vectorUpsertMany(collection, items, "main");
+    }
+
+    /**
+     * Delete many vectors by id, as one atomic batch. Returns how many of the ids were
+     * present.
+     */
+    public long vectorDeleteMany(String collection, List<String> ids, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("ids", Wire.wireList(requireNotNull(ids, "ids"), x -> x, "ids"));
+        return Wire.num(Wire.json(request(Wire.op("Vector", "DeleteMany", body), database)), "deleted");
+    }
+
+    public long vectorDeleteMany(String collection, List<String> ids) {
+        return vectorDeleteMany(collection, ids, "main");
+    }
+
+    /**
+     * Run several query vectors against one collection in one request. Answers
+     * positionally: one result list per query, in the order asked, each what a single
+     * search with the same arguments returns.
+     *
+     * <p>{@code options} may be {@code null}.
+     */
+    public List<List<VectorMatch>> vectorSearchBatch(String collection, List<float[]> vectors, int topK,
+                                                     VectorSearchOptions options, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("vectors", Wire.wireList(requireNotNull(vectors, "vectors"), Wire::vectorOf, "vectors"));
+        body.put("top_k", topK);
+        if (options != null) {
+            options.addTo(body);
+        }
+        List<List<VectorMatch>> out = new ArrayList<>();
+        for (Object batch : Wire.list(Wire.json(request(Wire.op("Vector", "SearchBatch", body), database)), "results")) {
+            if (!(batch instanceof List<?> hits)) {
+                throw new ProtocolException("batch result is not an array: " + Wire.describe(batch));
+            }
+            List<VectorMatch> matches = new ArrayList<>(hits.size());
+            for (Object o : hits) {
+                matches.add(VectorMatch.from(Wire.asObject(o, "search result")));
+            }
+            out.add(matches);
+        }
+        return out;
+    }
+
+    public List<List<VectorMatch>> vectorSearchBatch(String collection, List<float[]> vectors, int topK,
+                                                     VectorSearchOptions options) {
+        return vectorSearchBatch(collection, vectors, topK, options, "main");
+    }
+
+    public List<List<VectorMatch>> vectorSearchBatch(String collection, List<float[]> vectors, int topK) {
+        return vectorSearchBatch(collection, vectors, topK, null, "main");
+    }
+
+    /**
+     * Delete every vector whose metadata matches the filter, as one atomic batch. A
+     * filter is required. Returns how many were deleted.
+     */
+    public long vectorDeleteByFilter(String collection, Map<String, Object> filter, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("filter", requireNotNull(filter, "filter"));
+        return Wire.num(Wire.json(request(Wire.op("Vector", "DeleteByFilter", body), database)), "deleted");
+    }
+
+    public long vectorDeleteByFilter(String collection, Map<String, Object> filter) {
+        return vectorDeleteByFilter(collection, filter, "main");
+    }
+
+    /**
+     * Merge top-level metadata fields into every vector matching the filter, as one
+     * atomic batch; vectors are never touched. Returns how many were updated.
+     */
+    public long vectorUpdateByFilter(String collection, Map<String, Object> filter,
+                                     Map<String, Object> set, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("filter", requireNotNull(filter, "filter"));
+        body.put("set", requireNotNull(set, "set"));
+        return Wire.num(Wire.json(request(Wire.op("Vector", "UpdateByFilter", body), database)), "updated");
+    }
+
+    public long vectorUpdateByFilter(String collection, Map<String, Object> filter, Map<String, Object> set) {
+        return vectorUpdateByFilter(collection, filter, set, "main");
+    }
+
+    /**
+     * How many vectors a collection holds or, with a filter, how many match it. An
+     * exact count, not an estimate.
+     *
+     * <p>{@code filter} may be {@code null}.
+     */
+    public long vectorCount(String collection, Map<String, Object> filter, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("filter", filter);
+        return Wire.num(Wire.json(request(Wire.op("Vector", "Count", body), database)), "count");
+    }
+
+    public long vectorCount(String collection, Map<String, Object> filter) {
+        return vectorCount(collection, filter, "main");
+    }
+
+    public long vectorCount(String collection) {
+        return vectorCount(collection, null, "main");
+    }
+
+    /**
+     * The partitions of a collection: each distinct value of the metadata field
+     * (_namespace or _tenant) with its vector count.
+     */
+    public VectorPartitions vectorListPartitions(String collection, String field, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("field", field == null ? "_namespace" : field);
+        return VectorPartitions.from(Wire.json(request(Wire.op("Vector", "ListPartitions", body), database)));
+    }
+
+    public VectorPartitions vectorListPartitions(String collection, String field) {
+        return vectorListPartitions(collection, field, "main");
+    }
+
+    public VectorPartitions vectorListPartitions(String collection) {
+        return vectorListPartitions(collection, "_namespace", "main");
+    }
+
+    /**
+     * Rename a collection, moving its catalog record and every vector with it in one
+     * atomic batch. Refused when the new name already exists.
+     */
+    public void vectorRenameCollection(String collection, String to, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("to", require(to, "to"));
+        request(Wire.op("Vector", "RenameCollection", body), database);
+    }
+
+    public void vectorRenameCollection(String collection, String to) {
+        vectorRenameCollection(collection, to, "main");
+    }
+
+    /**
+     * Rebuild the collection's ANN index from its stored vectors and persist it,
+     * clearing every tombstone. Returned as the server's own JSON object.
+     */
+    public Map<String, Object> vectorRebuildIndex(String collection, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        return Wire.json(request(Wire.op("Vector", "RebuildIndex", body), database));
+    }
+
+    public Map<String, Object> vectorRebuildIndex(String collection) {
+        return vectorRebuildIndex(collection, "main");
+    }
+
+    /**
+     * The shape of the collection's ANN index: layers, degrees, tombstones,
+     * reachability and memory. Returned as the server's own JSON object, whose fields
+     * depend on the kind of index.
+     */
+    public Map<String, Object> vectorIndexStats(String collection, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        return Wire.json(request(Wire.op("Vector", "IndexStats", body), database));
+    }
+
+    public Map<String, Object> vectorIndexStats(String collection) {
+        return vectorIndexStats(collection, "main");
+    }
+
+    /**
+     * Measure the ANN index's recall: sampled stored vectors are each searched through
+     * the index and by an exact scan, and the overlap is reported. Returned as the
+     * server's own JSON object.
+     *
+     * <p>Each of {@code sample}, {@code topK}, {@code efSearch} may be {@code null}.
+     */
+    public Map<String, Object> vectorMeasureRecall(String collection, Integer sample, Integer topK,
+                                                   Integer efSearch, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("sample", sample);
+        body.put("top_k", topK);
+        body.put("ef_search", efSearch);
+        return Wire.json(request(Wire.op("Vector", "MeasureRecall", body), database));
+    }
+
+    public Map<String, Object> vectorMeasureRecall(String collection, Integer sample, Integer topK,
+                                                   Integer efSearch) {
+        return vectorMeasureRecall(collection, sample, topK, efSearch, "main");
+    }
+
+    public Map<String, Object> vectorMeasureRecall(String collection) {
+        return vectorMeasureRecall(collection, null, null, null, "main");
+    }
+
+    /**
+     * Search with several query vectors and return one fused ranking.
+     *
+     * <p>{@code filter} may be {@code null}.
+     */
+    public List<VectorMatch> vectorSearchMulti(String collection, List<float[]> vectors, int topK,
+                                               VectorFusion fusion, Map<String, Object> filter,
+                                               String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("vectors", Wire.wireList(requireNotNull(vectors, "vectors"), Wire::vectorOf, "vectors"));
+        body.put("top_k", topK);
+        body.put("fusion", (fusion == null ? VectorFusion.RRF : fusion).wire());
+        body.put("filter", filter);
+        List<VectorMatch> out = new ArrayList<>();
+        for (Object o : Wire.list(Wire.json(request(Wire.op("Vector", "SearchMulti", body), database)), "results")) {
+            out.add(VectorMatch.from(Wire.asObject(o, "search result")));
+        }
+        return out;
+    }
+
+    public List<VectorMatch> vectorSearchMulti(String collection, List<float[]> vectors, int topK,
+                                               VectorFusion fusion, Map<String, Object> filter) {
+        return vectorSearchMulti(collection, vectors, topK, fusion, filter, "main");
+    }
+
+    public List<VectorMatch> vectorSearchMulti(String collection, List<float[]> vectors, int topK) {
+        return vectorSearchMulti(collection, vectors, topK, VectorFusion.RRF, null, "main");
+    }
+
+    /**
+     * Change a collection's configuration; give at least one setting. normalize can
+     * only be set on an empty collection; m and efConstruction take effect at the next
+     * index build, which this forces. Returns the configuration now in force as the
+     * server's own JSON object.
+     *
+     * <p>Each of {@code normalize}, {@code m}, {@code efConstruction}, {@code
+     * multiTenant} may be {@code null}.
+     */
+    public Map<String, Object> vectorSetCollectionConfig(String collection, Boolean normalize, Integer m,
+                                                         Integer efConstruction, Boolean multiTenant,
+                                                         String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("normalize", normalize);
+        body.put("m", m);
+        body.put("ef_construction", efConstruction);
+        body.put("multi_tenant", multiTenant);
+        return Wire.json(request(Wire.op("Vector", "SetCollectionConfig", body), database));
+    }
+
+    public Map<String, Object> vectorSetCollectionConfig(String collection, Boolean normalize, Integer m,
+                                                         Integer efConstruction, Boolean multiTenant) {
+        return vectorSetCollectionConfig(collection, normalize, m, efConstruction, multiTenant, "main");
+    }
+
+    public Map<String, Object> vectorSetCollectionConfig(String collection) {
+        return vectorSetCollectionConfig(collection, null, null, null, null, "main");
+    }
+
+    /**
+     * Copy a collection, with its configuration and every vector, to a new name.
+     * Refused when the new name exists. Returns how many vectors were copied.
+     */
+    public long vectorCopyCollection(String collection, String to, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("to", require(to, "to"));
+        return Wire.num(Wire.json(request(Wire.op("Vector", "CopyCollection", body), database)), "copied");
+    }
+
+    public long vectorCopyCollection(String collection, String to) {
+        return vectorCopyCollection(collection, to, "main");
+    }
+
+    /**
+     * Search with a query built from examples: the sum of the positive examples minus
+     * the sum of the negative ones. Examples named by id are left out of the results
+     * unless excludeExamples is false.
+     *
+     * <p>{@code options} may be {@code null}.
+     */
+    public List<VectorMatch> vectorSearchByExamples(String collection, List<VectorExample> positive,
+                                                    int topK, List<VectorExample> negative,
+                                                    boolean excludeExamples, VectorSearchOptions options,
+                                                    String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("collection", require(collection, "collection"));
+        body.put("positive", Wire.wireList(requireNotNull(positive, "positive"), VectorExample::wire, "positive"));
+        body.put("negative", Wire.wireList(negative, VectorExample::wire, "negative"));
+        body.put("top_k", topK);
+        body.put("exclude_examples", excludeExamples);
+        if (options != null) {
+            options.addTo(body);
+        }
+        List<VectorMatch> out = new ArrayList<>();
+        for (Object o : Wire.list(Wire.json(request(Wire.op("Vector", "SearchByExamples", body), database)), "results")) {
+            out.add(VectorMatch.from(Wire.asObject(o, "search result")));
+        }
+        return out;
+    }
+
+    public List<VectorMatch> vectorSearchByExamples(String collection, List<VectorExample> positive,
+                                                    int topK, List<VectorExample> negative,
+                                                    boolean excludeExamples, VectorSearchOptions options) {
+        return vectorSearchByExamples(collection, positive, topK, negative, excludeExamples, options, "main");
+    }
+
+    public List<VectorMatch> vectorSearchByExamples(String collection, List<VectorExample> positive,
+                                                    int topK) {
+        return vectorSearchByExamples(collection, positive, topK, List.of(), true, null, "main");
     }
 
     // -- graph -------------------------------------------------------------------
@@ -1902,6 +3582,698 @@ public final class TriCore implements AutoCloseable {
         return graphQuery(graph, cypher, "main");
     }
 
+    // -- graph: added for server 0.1.0-rc.3 -----------------------------------
+    //
+    // An older server answers each of these with an error naming the unknown
+    // operation.
+
+    /**
+     * Write many nodes and edges as one unit: every record lands or none does. Nodes
+     * are written before edges, so an edge may join nodes created in the same batch.
+     * Each record replaces any existing one with its id.
+     */
+    public GraphBatchResult graphAddMany(String graph, List<GraphNode> nodes, List<GraphEdge> edges,
+                                         String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("nodes", Wire.wireList(requireNotNull(nodes, "nodes"), Wire::nodeInput, "nodes"));
+        body.put("edges", Wire.wireList(edges, Wire::edgeInput, "edges"));
+        return GraphBatchResult.from(Wire.json(request(Wire.op("Graph", "AddMany", body), database)));
+    }
+
+    public GraphBatchResult graphAddMany(String graph, List<GraphNode> nodes, List<GraphEdge> edges) {
+        return graphAddMany(graph, nodes, edges, "main");
+    }
+
+    public GraphBatchResult graphAddMany(String graph, List<GraphNode> nodes) {
+        return graphAddMany(graph, nodes, List.of(), "main");
+    }
+
+    /**
+     * Delete many nodes and edges as one unit. An id that is not there is skipped. With
+     * detach, every edge touching a removed node goes too.
+     */
+    public GraphRemoveResult graphRemoveMany(String graph, List<String> nodes, List<String> edges,
+                                             boolean detach, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("nodes", Wire.wireList(requireNotNull(nodes, "nodes"), x -> x, "nodes"));
+        body.put("edges", Wire.wireList(edges, x -> x, "edges"));
+        body.put("detach", detach);
+        return GraphRemoveResult.from(Wire.json(request(Wire.op("Graph", "RemoveMany", body), database)));
+    }
+
+    public GraphRemoveResult graphRemoveMany(String graph, List<String> nodes, List<String> edges,
+                                             boolean detach) {
+        return graphRemoveMany(graph, nodes, edges, detach, "main");
+    }
+
+    public GraphRemoveResult graphRemoveMany(String graph, List<String> nodes) {
+        return graphRemoveMany(graph, nodes, List.of(), false, "main");
+    }
+
+    /**
+     * Change an existing node in place and return it. properties is a JSON merge patch:
+     * a key set to a value is set, a key set to null is removed, and a key left out is
+     * left alone. Labels are removed before they are added.
+     *
+     * <p>{@code properties} may be {@code null}.
+     */
+    public GraphNode graphUpdateNode(String graph, String id, Map<String, Object> properties,
+                                     List<String> addLabels, List<String> removeLabels, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("id", require(id, "id"));
+        if (properties != null) {
+            body.put("properties", properties);
+        }
+        body.put("add_labels", Wire.wireList(addLabels, x -> x, "add_labels"));
+        body.put("remove_labels", Wire.wireList(removeLabels, x -> x, "remove_labels"));
+        return GraphNode.from(Wire.json(request(Wire.op("Graph", "UpdateNode", body), database)));
+    }
+
+    public GraphNode graphUpdateNode(String graph, String id, Map<String, Object> properties,
+                                     List<String> addLabels, List<String> removeLabels) {
+        return graphUpdateNode(graph, id, properties, addLabels, removeLabels, "main");
+    }
+
+    public GraphNode graphUpdateNode(String graph, String id) {
+        return graphUpdateNode(graph, id, null, List.of(), List.of(), "main");
+    }
+
+    /**
+     * Change an existing edge in place and return it: properties merges as for a node,
+     * and label, when given, changes the edge's type. The endpoints cannot change.
+     *
+     * <p>Each of {@code properties}, {@code label} may be {@code null}.
+     */
+    public GraphEdge graphUpdateEdge(String graph, String id, Map<String, Object> properties, String label,
+                                     String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("id", require(id, "id"));
+        if (properties != null) {
+            body.put("properties", properties);
+        }
+        body.put("label", label);
+        return GraphEdge.from(Wire.json(request(Wire.op("Graph", "UpdateEdge", body), database)));
+    }
+
+    public GraphEdge graphUpdateEdge(String graph, String id, Map<String, Object> properties, String label) {
+        return graphUpdateEdge(graph, id, properties, label, "main");
+    }
+
+    public GraphEdge graphUpdateEdge(String graph, String id) {
+        return graphUpdateEdge(graph, id, null, null, "main");
+    }
+
+    /**
+     * Copy a graph, with its nodes, edges and schema, to a new name. Refused when the
+     * new name exists.
+     */
+    public GraphBatchResult graphCopy(String graph, String to, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("to", require(to, "to"));
+        return GraphBatchResult.from(Wire.json(request(Wire.op("Graph", "CopyGraph", body), database)));
+    }
+
+    public GraphBatchResult graphCopy(String graph, String to) {
+        return graphCopy(graph, to, "main");
+    }
+
+    /**
+     * Bounded depth-first walk from start: the nodes within maxDepth hops, in depth-
+     * first preorder, each with the shortest depth found. The server clamps maxDepth
+     * and limit.
+     *
+     * <p>Each of {@code label}, {@code maxDepth}, {@code limit} may be {@code null}.
+     */
+    public GraphTraversal graphDfs(String graph, String start, GraphDirection direction, String label,
+                                   Integer maxDepth, Integer limit, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("start", require(start, "start"));
+        body.put("direction", (direction == null ? GraphDirection.OUTGOING : direction).wire());
+        body.put("label", label);
+        body.put("max_depth", maxDepth);
+        body.put("limit", limit);
+        return traversalOf(Wire.json(request(Wire.op("Graph", "Dfs", body), database)));
+    }
+
+    public GraphTraversal graphDfs(String graph, String start, GraphDirection direction, String label,
+                                   Integer maxDepth, Integer limit) {
+        return graphDfs(graph, start, direction, label, maxDepth, limit, "main");
+    }
+
+    public GraphTraversal graphDfs(String graph, String start) {
+        return graphDfs(graph, start, GraphDirection.OUTGOING, null, null, null, "main");
+    }
+
+    /**
+     * Partition the graph's nodes into connected components, largest first. Weak
+     * ignores edge direction; strong groups nodes that can each reach the other. limit
+     * bounds how many are listed, never how many are counted.
+     *
+     * <p>Each of {@code label}, {@code limit} may be {@code null}.
+     */
+    public GraphComponents graphConnectedComponents(String graph, GraphComponentKind kind, String label,
+                                                    Integer limit, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("kind", (kind == null ? GraphComponentKind.WEAK : kind).wire());
+        body.put("label", label);
+        body.put("limit", limit);
+        return GraphComponents.from(Wire.json(
+                request(Wire.op("Graph", "ConnectedComponents", body), database)));
+    }
+
+    public GraphComponents graphConnectedComponents(String graph, GraphComponentKind kind, String label,
+                                                    Integer limit) {
+        return graphConnectedComponents(graph, kind, label, limit, "main");
+    }
+
+    public GraphComponents graphConnectedComponents(String graph) {
+        return graphConnectedComponents(graph, GraphComponentKind.WEAK, null, null, "main");
+    }
+
+    /**
+     * Whether the graph contains a cycle, and one cycle as evidence. directed follows
+     * edge direction; undirected treats every edge as two-way.
+     *
+     * <p>{@code label} may be {@code null}.
+     */
+    public GraphCycle graphDetectCycle(String graph, boolean directed, String label, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("directed", directed);
+        body.put("label", label);
+        return GraphCycle.from(Wire.json(request(Wire.op("Graph", "DetectCycle", body), database)));
+    }
+
+    public GraphCycle graphDetectCycle(String graph, boolean directed, String label) {
+        return graphDetectCycle(graph, directed, label, "main");
+    }
+
+    public GraphCycle graphDetectCycle(String graph) {
+        return graphDetectCycle(graph, true, null, "main");
+    }
+
+    /**
+     * Counts describing a graph: nodes and edges, per node label and per edge type,
+     * self-loops, isolated nodes, degree extremes and dangling edges. Returned as the
+     * server's own JSON object.
+     */
+    public Map<String, Object> graphStats(String graph, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        return Wire.json(request(Wire.op("Graph", "GraphStats", body), database));
+    }
+
+    public Map<String, Object> graphStats(String graph) {
+        return graphStats(graph, "main");
+    }
+
+    /**
+     * The part of the graph within maxDepth hops of the seeds: the nodes reached and
+     * every edge joining two of them.
+     *
+     * <p>Each of {@code label}, {@code maxDepth}, {@code limit} may be {@code null}.
+     */
+    public GraphSubgraph graphSubgraph(String graph, List<String> seeds, GraphDirection direction,
+                                       String label, Integer maxDepth, Integer limit, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("seeds", Wire.wireList(requireNotNull(seeds, "seeds"), x -> x, "seeds"));
+        body.put("direction", (direction == null ? GraphDirection.BOTH : direction).wire());
+        body.put("label", label);
+        body.put("max_depth", maxDepth);
+        body.put("limit", limit);
+        return GraphSubgraph.from(Wire.json(request(Wire.op("Graph", "Subgraph", body), database)));
+    }
+
+    public GraphSubgraph graphSubgraph(String graph, List<String> seeds, GraphDirection direction,
+                                       String label, Integer maxDepth, Integer limit) {
+        return graphSubgraph(graph, seeds, direction, label, maxDepth, limit, "main");
+    }
+
+    public GraphSubgraph graphSubgraph(String graph, List<String> seeds) {
+        return graphSubgraph(graph, seeds, GraphDirection.BOTH, null, null, null, "main");
+    }
+
+    /**
+     * What the graph's data looks like: its node labels and edge types, each with a
+     * count and the property keys seen on it. Returned as the server's own JSON object.
+     */
+    public Map<String, Object> graphSchema(String graph, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        return Wire.json(request(Wire.op("Graph", "GraphSchema", body), database));
+    }
+
+    public Map<String, Object> graphSchema(String graph) {
+        return graphSchema(graph, "main");
+    }
+
+    /**
+     * The k cheapest loopless paths between two nodes, cheapest first. Without
+     * weightProperty every edge costs 1; with it, an edge's cost is that numeric
+     * property.
+     *
+     * <p>Each of {@code k}, {@code label}, {@code weightProperty} may be {@code null}.
+     */
+    public List<GraphRankedPath> graphKShortestPaths(String graph, String from, String to, Integer k,
+                                                     GraphDirection direction, String label,
+                                                     String weightProperty, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("from", require(from, "from"));
+        body.put("to", require(to, "to"));
+        body.put("k", k);
+        body.put("direction", (direction == null ? GraphDirection.OUTGOING : direction).wire());
+        body.put("label", label);
+        body.put("weight_property", weightProperty);
+        List<GraphRankedPath> out = new ArrayList<>();
+        for (Object o : Wire.list(Wire.json(request(Wire.op("Graph", "KShortestPaths", body), database)), "paths")) {
+            out.add(GraphRankedPath.from(Wire.asObject(o, "paths")));
+        }
+        return out;
+    }
+
+    public List<GraphRankedPath> graphKShortestPaths(String graph, String from, String to, Integer k,
+                                                     GraphDirection direction, String label,
+                                                     String weightProperty) {
+        return graphKShortestPaths(graph, from, to, k, direction, label, weightProperty, "main");
+    }
+
+    public List<GraphRankedPath> graphKShortestPaths(String graph, String from, String to) {
+        return graphKShortestPaths(graph, from, to, null, GraphDirection.OUTGOING, null, null, "main");
+    }
+
+    /**
+     * Every simple path between two nodes of at most maxDepth edges, up to limit paths.
+     * A work budget bounds the search, and the result says whether the enumeration
+     * finished.
+     *
+     * <p>Each of {@code label}, {@code maxDepth}, {@code limit} may be {@code null}.
+     */
+    public GraphPaths graphAllPaths(String graph, String from, String to, GraphDirection direction,
+                                    String label, Integer maxDepth, Integer limit, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("from", require(from, "from"));
+        body.put("to", require(to, "to"));
+        body.put("direction", (direction == null ? GraphDirection.OUTGOING : direction).wire());
+        body.put("label", label);
+        body.put("max_depth", maxDepth);
+        body.put("limit", limit);
+        return GraphPaths.from(Wire.json(request(Wire.op("Graph", "AllPaths", body), database)));
+    }
+
+    public GraphPaths graphAllPaths(String graph, String from, String to, GraphDirection direction,
+                                    String label, Integer maxDepth, Integer limit) {
+        return graphAllPaths(graph, from, to, direction, label, maxDepth, limit, "main");
+    }
+
+    public GraphPaths graphAllPaths(String graph, String from, String to) {
+        return graphAllPaths(graph, from, to, GraphDirection.OUTGOING, null, null, null, "main");
+    }
+
+    /**
+     * Betweenness, closeness or eigenvector centrality, top limit nodes, best first.
+     * iterations and tolerance tune eigenvector only.
+     *
+     * <p>Each of {@code label}, {@code limit}, {@code iterations}, {@code tolerance}
+     * may be {@code null}.
+     */
+    public List<GraphScore> graphCentrality(String graph, GraphCentralityMeasure measure, boolean directed,
+                                            String label, Integer limit, Integer iterations,
+                                            Double tolerance, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("measure", requireNotNull(measure, "measure").wire());
+        body.put("directed", directed);
+        body.put("label", label);
+        body.put("limit", limit);
+        body.put("iterations", iterations);
+        body.put("tolerance", tolerance);
+        List<GraphScore> out = new ArrayList<>();
+        for (Object o : Wire.list(Wire.json(request(Wire.op("Graph", "Centrality", body), database)), "results")) {
+            out.add(GraphScore.from(Wire.asObject(o, "results")));
+        }
+        return out;
+    }
+
+    public List<GraphScore> graphCentrality(String graph, GraphCentralityMeasure measure, boolean directed,
+                                            String label, Integer limit, Integer iterations,
+                                            Double tolerance) {
+        return graphCentrality(graph, measure, directed, label, limit, iterations, tolerance, "main");
+    }
+
+    public List<GraphScore> graphCentrality(String graph, GraphCentralityMeasure measure) {
+        return graphCentrality(graph, measure, true, null, null, null, null, "main");
+    }
+
+    /**
+     * Communities by Louvain modularity optimisation, direction ignored, largest first,
+     * with the partition's modularity.
+     *
+     * <p>Each of {@code label}, {@code iterations}, {@code limit} may be {@code null}.
+     */
+    public GraphCommunities graphCommunities(String graph, String label, Integer iterations, Integer limit,
+                                             String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("label", label);
+        body.put("iterations", iterations);
+        body.put("limit", limit);
+        return GraphCommunities.from(Wire.json(request(Wire.op("Graph", "Communities", body), database)));
+    }
+
+    public GraphCommunities graphCommunities(String graph, String label, Integer iterations, Integer limit) {
+        return graphCommunities(graph, label, iterations, limit, "main");
+    }
+
+    public GraphCommunities graphCommunities(String graph) {
+        return graphCommunities(graph, null, null, null, "main");
+    }
+
+    /**
+     * Triangles and clustering coefficients, direction ignored.
+     *
+     * <p>Each of {@code label}, {@code limit} may be {@code null}.
+     */
+    public GraphTriangles graphTriangleCount(String graph, String label, Integer limit, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("label", label);
+        body.put("limit", limit);
+        return GraphTriangles.from(Wire.json(request(Wire.op("Graph", "TriangleCount", body), database)));
+    }
+
+    public GraphTriangles graphTriangleCount(String graph, String label, Integer limit) {
+        return graphTriangleCount(graph, label, limit, "main");
+    }
+
+    public GraphTriangles graphTriangleCount(String graph) {
+        return graphTriangleCount(graph, null, null, "main");
+    }
+
+    /**
+     * The nodes whose neighbour sets most resemble the given node's, best first.
+     *
+     * <p>Each of {@code label}, {@code limit} may be {@code null}.
+     */
+    public List<GraphScore> graphNodeSimilarity(String graph, String node, GraphDirection direction,
+                                                String label, GraphSimilarityMetric metric, Integer limit,
+                                                String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("node", require(node, "node"));
+        body.put("direction", (direction == null ? GraphDirection.BOTH : direction).wire());
+        body.put("label", label);
+        body.put("metric", (metric == null ? GraphSimilarityMetric.JACCARD : metric).wire());
+        body.put("limit", limit);
+        List<GraphScore> out = new ArrayList<>();
+        for (Object o : Wire.list(Wire.json(request(Wire.op("Graph", "NodeSimilarity", body), database)), "results")) {
+            out.add(GraphScore.from(Wire.asObject(o, "results")));
+        }
+        return out;
+    }
+
+    public List<GraphScore> graphNodeSimilarity(String graph, String node, GraphDirection direction,
+                                                String label, GraphSimilarityMetric metric, Integer limit) {
+        return graphNodeSimilarity(graph, node, direction, label, metric, limit, "main");
+    }
+
+    public List<GraphScore> graphNodeSimilarity(String graph, String node) {
+        return graphNodeSimilarity(
+                graph, node, GraphDirection.BOTH, null, GraphSimilarityMetric.JACCARD, null, "main");
+    }
+
+    /**
+     * Check a graph's stored records against each other and against the resident
+     * mirror: dangling edges, undecodable records, records stored under another id, and
+     * any disagreement between mirror and storage. Returned as the server's own JSON
+     * object.
+     */
+    public Map<String, Object> graphCheckConsistency(String graph, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        return Wire.json(request(Wire.op("Graph", "CheckConsistency", body), database));
+    }
+
+    public Map<String, Object> graphCheckConsistency(String graph) {
+        return graphCheckConsistency(graph, "main");
+    }
+
+    /**
+     * Index node properties for finding nodes by value. With one property it is a
+     * property index, with several a composite one; label limits it to nodes carrying
+     * that label.
+     *
+     * <p>{@code label} may be {@code null}.
+     */
+    public void graphCreateNodeIndex(String graph, String name, List<String> properties, String label,
+                                     String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("name", require(name, "name"));
+        body.put("label", label);
+        body.put("properties", Wire.wireList(requireNotNull(properties, "properties"), x -> x, "properties"));
+        request(Wire.op("Graph", "CreateNodeIndex", body), database);
+    }
+
+    public void graphCreateNodeIndex(String graph, String name, List<String> properties, String label) {
+        graphCreateNodeIndex(graph, name, properties, label, "main");
+    }
+
+    public void graphCreateNodeIndex(String graph, String name, List<String> properties) {
+        graphCreateNodeIndex(graph, name, properties, null, "main");
+    }
+
+    /**
+     * Enforce a rule on a property of every node, or with the edge target every
+     * relationship, carrying a label. Refused when a stored record already breaks it;
+     * afterwards every write that would break it is refused.
+     */
+    public void graphCreateConstraint(String graph, String name, String label, String property,
+                                      GraphConstraintKind kind, GraphConstraintTarget target,
+                                      String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("name", require(name, "name"));
+        body.put("label", require(label, "label"));
+        body.put("property", require(property, "property"));
+        body.put("kind", requireNotNull(kind, "kind").wire());
+        body.put("target", (target == null ? GraphConstraintTarget.NODE : target).wire());
+        request(Wire.op("Graph", "CreateConstraint", body), database);
+    }
+
+    public void graphCreateConstraint(String graph, String name, String label, String property,
+                                      GraphConstraintKind kind, GraphConstraintTarget target) {
+        graphCreateConstraint(graph, name, label, property, kind, target, "main");
+    }
+
+    public void graphCreateConstraint(String graph, String name, String label, String property,
+                                      GraphConstraintKind kind) {
+        graphCreateConstraint(graph, name, label, property, kind, GraphConstraintTarget.NODE, "main");
+    }
+
+    /**
+     * Drop an index or a constraint by name.
+     */
+    public void graphDropSchemaObject(String graph, String name, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("name", require(name, "name"));
+        request(Wire.op("Graph", "DropSchemaObject", body), database);
+    }
+
+    public void graphDropSchemaObject(String graph, String name) {
+        graphDropSchemaObject(graph, name, "main");
+    }
+
+    /**
+     * A graph's indexes and constraints.
+     */
+    public GraphSchemaObjects graphListSchemaObjects(String graph, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        return GraphSchemaObjects.from(Wire.json(
+                request(Wire.op("Graph", "ListSchemaObjects", body), database)));
+    }
+
+    public GraphSchemaObjects graphListSchemaObjects(String graph) {
+        return graphListSchemaObjects(graph, "main");
+    }
+
+    /**
+     * Nodes with the label (when given) whose properties equal the given values, in id
+     * order, answered from an index that covers the request, the label index, or a
+     * scan; the result says which.
+     *
+     * <p>Each of {@code label}, {@code properties}, {@code limit} may be {@code null}.
+     */
+    public GraphFindResult graphFindNodes(String graph, String label, Map<String, Object> properties,
+                                          Integer limit, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("label", label);
+        if (properties != null) {
+            body.put("properties", properties);
+        }
+        body.put("limit", limit);
+        return GraphFindResult.from(Wire.json(request(Wire.op("Graph", "FindNodes", body), database)));
+    }
+
+    public GraphFindResult graphFindNodes(String graph, String label, Map<String, Object> properties,
+                                          Integer limit) {
+        return graphFindNodes(graph, label, properties, limit, "main");
+    }
+
+    public GraphFindResult graphFindNodes(String graph) {
+        return graphFindNodes(graph, null, null, null, "main");
+    }
+
+    /**
+     * Import nodes and edges from CSV text, as one atomic batch, so constraints apply.
+     *
+     * <p>Each of {@code nodes}, {@code edges} may be {@code null}.
+     */
+    public GraphBatchResult graphImportCsv(String graph, String nodes, String edges, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("nodes", nodes);
+        body.put("edges", edges);
+        return GraphBatchResult.from(Wire.json(request(Wire.op("Graph", "ImportCsv", body), database)));
+    }
+
+    public GraphBatchResult graphImportCsv(String graph, String nodes, String edges) {
+        return graphImportCsv(graph, nodes, edges, "main");
+    }
+
+    public GraphBatchResult graphImportCsv(String graph) {
+        return graphImportCsv(graph, null, null, "main");
+    }
+
+    /**
+     * PageRank over edge direction: the top limit nodes by rank, best first. damping
+     * must lie in [0, 1).
+     *
+     * <p>Each of {@code damping}, {@code iterations}, {@code tolerance}, {@code label},
+     * {@code limit} may be {@code null}.
+     */
+    public List<GraphScore> graphPageRank(String graph, Double damping, Integer iterations,
+                                          Double tolerance, String label, Integer limit, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("damping", damping);
+        body.put("iterations", iterations);
+        body.put("tolerance", tolerance);
+        body.put("label", label);
+        body.put("limit", limit);
+        List<GraphScore> out = new ArrayList<>();
+        for (Object o : Wire.list(Wire.json(request(Wire.op("Graph", "PageRank", body), database)), "ranks")) {
+            out.add(GraphScore.from(Wire.asObject(o, "ranks")));
+        }
+        return out;
+    }
+
+    public List<GraphScore> graphPageRank(String graph, Double damping, Integer iterations,
+                                          Double tolerance, String label, Integer limit) {
+        return graphPageRank(graph, damping, iterations, tolerance, label, limit, "main");
+    }
+
+    public List<GraphScore> graphPageRank(String graph) {
+        return graphPageRank(graph, null, null, null, null, null, "main");
+    }
+
+    /**
+     * Run a Cypher write: CREATE, MERGE, SET, REMOVE or DELETE, optionally after MATCH
+     * and WHERE. Inside a graph transaction the statement is queued rather than
+     * applied. Returned as the server's own JSON object: counters when applied, the
+     * queue length when queued.
+     */
+    public Map<String, Object> graphExecute(String graph, String cypher, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        body.put("cypher", require(cypher, "cypher"));
+        return Wire.json(request(Wire.op("Graph", "Execute", body), database));
+    }
+
+    public Map<String, Object> graphExecute(String graph, String cypher) {
+        return graphExecute(graph, cypher, "main");
+    }
+
+    /**
+     * Open a transaction on a graph and return its id. An Execute that carries the id
+     * is queued rather than applied.
+     */
+    public String graphBeginTransaction(String graph, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        return Wire.str(Wire.json(
+                request(Wire.op("Graph", "BeginTransaction", body), database)), "transaction");
+    }
+
+    public String graphBeginTransaction(String graph) {
+        return graphBeginTransaction(graph, "main");
+    }
+
+    /**
+     * Apply every queued statement of a transaction as one unit: all of them or none.
+     * Returned as the server's own JSON object of counters.
+     */
+    public Map<String, Object> graphCommitTransaction(String graph, String txn, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        try {
+            return Wire.json(request(Wire.op("Graph", "CommitTransaction", body), database, require(txn, "txn")));
+        } finally {
+            if (txn != null && txn.equals(requestTxn)) {
+                requestTxn = null;
+            }
+        }
+    }
+
+    public Map<String, Object> graphCommitTransaction(String graph, String txn) {
+        return graphCommitTransaction(graph, txn, "main");
+    }
+
+    /**
+     * Discard a transaction and its queued statements.
+     */
+    public void graphRollbackTransaction(String graph, String txn, String database) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("graph", require(graph, "graph"));
+        try {
+            request(Wire.op("Graph", "RollbackTransaction", body), database, require(txn, "txn"));
+        } finally {
+            if (txn != null && txn.equals(requestTxn)) {
+                requestTxn = null;
+            }
+        }
+    }
+
+    public void graphRollbackTransaction(String graph, String txn) {
+        graphRollbackTransaction(graph, txn, "main");
+    }
+
+    private static GraphTraversal traversalOf(Map<String, Object> m) {
+        List<GraphTraversalNode> nodes = new ArrayList<>();
+        for (Object o : Wire.list(m, "nodes")) {
+            nodes.add(GraphTraversalNode.from(Wire.asObject(o, "traversal node")));
+        }
+        return new GraphTraversal(
+                Wire.str(m, "start"),
+                GraphDirection.fromWire(Wire.str(m, "direction")),
+                Wire.num(m, "max_depth"),
+                Wire.num(m, "limit"),
+                Wire.bool(m, "truncated"),
+                nodes);
+    }
+
     // -- llm ---------------------------------------------------------------------
     //
     // Read-only context assembly. No LLM operation ever writes.
@@ -2192,10 +4564,11 @@ public final class TriCore implements AutoCloseable {
      * Transaction control travels as {@code Exec}: the server authorizes it as a
      * write and refuses it on {@code Query}.
      *
-     * <p>{@code txnOpen} follows what the server answered. Every
-     * {@code COMMIT}/{@code ROLLBACK} reply — a refusal included — means the
-     * block is over, because the server ends it either way; the one exception is
-     * a request that never left this process, which is what
+     * <p>{@code txnOpen} follows what the server answered. A
+     * {@code COMMIT}/{@code ROLLBACK} reply means the block is over — a refusal
+     * included, because the server ends it either way — unless the reply
+     * carries {@code nested_depth}, which says only a nested block ended. The
+     * one exception is a request that never left this process, which is what
      * {@link RequestNotSentException} names.
      */
     private TransactionResult txnControl(String keyword, String database) {
@@ -2208,8 +4581,12 @@ public final class TriCore implements AutoCloseable {
             }
             throw e;
         }
-        txnOpen = "BEGIN".equals(keyword);
-        return TransactionResult.from(Wire.json(resp));
+        TransactionResult result = TransactionResult.from(Wire.json(resp));
+        // A BEGIN inside an open block opens a nested one, and the COMMIT or
+        // ROLLBACK that answers it ends only that: the server says so with
+        // `nested_depth`, and the outer block is still open either way.
+        txnOpen = result.nestedDepth().isPresent() || "BEGIN".equals(keyword);
+        return result;
     }
 
     /**

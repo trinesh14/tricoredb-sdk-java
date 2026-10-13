@@ -121,12 +121,40 @@ class SessionTxnLiveTest {
     }
 
     @Test
-    void f_nestingIsRefused() {
+    void f_aNestedBeginOpensABlockWhoseRollbackUndoesOnlyItself() {
         db.begin();
-        TriCoreException e = assertThrows(TriCoreException.class, db::begin);
-        assertTrue(e.getMessage().contains("already open"), e.getMessage());
+        db.execute("INSERT INTO " + TABLE + " VALUES (6, 600)");
+
+        TransactionResult inner = db.begin();
+        assertEquals(1, inner.nestedDepth().orElseThrow());
+        db.execute("INSERT INTO " + TABLE + " VALUES (7, 700)");
+        assertEquals(2, count(db));
+
+        TransactionResult undone = db.rollback();
+        assertEquals(0, undone.nestedDepth().orElseThrow());
+        assertTrue(db.inTransaction(), "rolling back the nested block leaves the outer one open");
+        assertEquals(List.of(List.of("6")), db.query("SELECT id FROM " + TABLE).rows());
+        assertEquals(0, count(other));
+
+        TransactionResult committed = db.commit();
+        assertTrue(committed.committed());
+        assertTrue(committed.nestedDepth().isEmpty());
+        assertFalse(db.inTransaction());
+        assertEquals(List.of(List.of("6", "600")), other.query("SELECT id, v FROM " + TABLE).rows());
+    }
+
+    @Test
+    void f_aNestedCommitKeepsTheOuterBlockOpenAndItsRollbackUndoesBoth() {
+        db.begin();
+        db.execute("INSERT INTO " + TABLE + " VALUES (8, 800)");
+        db.begin();
+        db.execute("INSERT INTO " + TABLE + " VALUES (9, 900)");
+        assertEquals(0, db.commit().nestedDepth().orElseThrow());
         assertTrue(db.inTransaction());
-        db.rollback();
+        assertEquals(2, count(db));
+        assertEquals("rolled_back", db.rollback().outcome());
+        assertFalse(db.inTransaction());
+        assertEquals(0, count(db));
     }
 
     @Test

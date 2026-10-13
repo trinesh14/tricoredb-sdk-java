@@ -4,6 +4,86 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-10-13
+
+### Added
+
+A typed method for each of the 116 operations the server gained after
+0.1.0-rc.2. **They need `tricore-server` 0.1.0-rc.3 or later; an older server
+answers each of them with an error**, raised as `TriCoreException`. Everything
+that was in 0.2.0 still works against an older server.
+
+- **Cache** (53): sorted sets (`cacheZAdd` ... `cacheZIncrBy`), locks with
+  fencing tokens (`cacheLockAcquire`, `cacheLockRenew`, `cacheLockRelease`),
+  bitmaps (`cacheSetBit` ... `cacheBitOp`), HyperLogLog (`cachePfAdd`,
+  `cachePfCount`, `cachePfMerge`), many keys at once (`cacheMGet`,
+  `cacheMSet`, `cacheWarm`), conditional and atomic writes (`cacheSetIf`,
+  `cacheCompareAndSwap`, `cacheGetDel`, `cacheGetSet`, `cacheGetEx`,
+  `cacheAppend`, `cacheExpireAt`, `cacheHIncrBy`), stale-while-revalidate
+  (`cacheSetFresh`, `cacheGetFresh`, `cacheSetMissing`), list and set
+  additions (`cacheLMove`, `cacheLTrim`, `cacheBLPop`, `cacheBRPop`,
+  `cacheSUnion`, `cacheSInter`, `cacheSDiff`, `cacheSRandMember`), batches
+  (`cachePipeline`, `cacheTransaction`, `cacheScriptLoad`, `cacheScriptRun`,
+  built from `CacheCommand`), Pub/Sub by polling (`cachePublish`,
+  `cachePoll`), namespace limits, `cacheStats`, `cacheHotKeys`,
+  `cachePurgeExpired` and `cacheFlushDatabase`.
+- **Documents** (13): `documentReplace`, `documentInsertMany`,
+  `documentDeleteMany`, `documentBulkWrite` (a list of `BulkOp.insert`,
+  `BulkOp.updateOne`, `BulkOp.replace` and `BulkOp.delete`),
+  `documentExplain`, `documentRenameCollection`, `documentPurgeExpired`,
+  `documentRebuildIndex`, collection options (`documentSetCollectionOptions`,
+  `documentGetCollectionOptions`, `CollectionOptions`) and transactions
+  spanning requests (`documentBeginTransaction`, `documentCommitTransaction`,
+  `documentRollbackTransaction`).
+- **Vectors** (21): `vectorUpsertMany`, `vectorDeleteMany`,
+  `vectorSearchBatch`, `vectorSearchMulti`, `vectorSearchByExamples`,
+  `vectorDeleteByFilter`, `vectorUpdateByFilter`, `vectorCount`, named vectors
+  (`vectorAddNamedVector`, `vectorUpsertNamed`), aliases (`vectorSetAlias`,
+  `vectorListAliases`), the built-in embedder (`vectorEmbed`,
+  `vectorUpsertText`), `vectorListPartitions`, `vectorRenameCollection`,
+  `vectorCopyCollection`, `vectorSetCollectionConfig`, `vectorRebuildIndex`,
+  `vectorIndexStats` and `vectorMeasureRecall`.
+- **Graph** (29): `graphAddMany`, `graphRemoveMany`, `graphUpdateNode`,
+  `graphUpdateEdge`, `graphCopy`, `graphImportCsv`, `graphDfs`,
+  `graphSubgraph`, `graphKShortestPaths`, `graphAllPaths`,
+  `graphConnectedComponents`, `graphDetectCycle`, `graphCentrality`,
+  `graphCommunities`, `graphTriangleCount`, `graphNodeSimilarity`,
+  `graphPageRank`, `graphStats`, `graphSchema`, `graphCheckConsistency`,
+  indexes and constraints (`graphCreateNodeIndex`, `graphCreateConstraint`,
+  `graphDropSchemaObject`, `graphListSchemaObjects`, `graphFindNodes`), Cypher
+  writes (`graphExecute`) and graph transactions (`graphBeginTransaction`,
+  `graphCommitTransaction`, `graphRollbackTransaction`).
+- `TriCore.setRequestTxn` / `requestTxn()`: the document or graph transaction
+  every request from the connection runs inside. Committing or rolling that
+  transaction back clears it.
+
+### Changed
+
+- A `BEGIN` inside an open session transaction is no longer refused by the
+  server: from 0.1.0-rc.3 it opens a nested block backed by a savepoint, whose
+  `COMMIT` releases it and whose `ROLLBACK` undoes only that block. `begin()`,
+  `commit()` and `rollback()` used to throw `ProtocolException` on the answer
+  to such a statement; they now return it, `TransactionResult.nestedDepth()`
+  reports how many nested blocks remain open, and `inTransaction()` stays true
+  until the outer block ends. `TransactionResult` gained that fifth component;
+  the four-argument constructor remains. The live test that pinned the old
+  refusal now checks the nested behaviour.
+
+### Notes
+
+- A wide diagnostic answer (`cacheStats`, `documentExplain`, `graphStats`,
+  `graphSchema`, `graphCheckConsistency`, `graphExecute`,
+  `graphCommitTransaction`, and the vector index reports) comes back as the
+  server's own JSON object rather than a record, because its fields depend on
+  the server's configuration and on what it found.
+- `cacheHotKeys` returns the server's JSON undecoded. The server refuses it
+  unless `[cache] hot_keys` is above zero, and it was not exercised against a
+  server that has it on.
+- `VectorSearchOptions` carries the search settings this driver names; the
+  server's remaining search settings can be sent with `request`.
+- JSON cannot carry an infinite number, so an open end of a score range is
+  `ScoreBound.min()` or `ScoreBound.max()`, the largest finite doubles.
+
 ## [0.2.0] - 2026-09-17
 
 ### Added
